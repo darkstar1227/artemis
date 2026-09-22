@@ -222,7 +222,9 @@ async def escalate(req: EscalateRequest) -> EscalationReport:
         "若判斷不需要任何動作,action_taken 請填 \"none\"。"
         "同時對這個事件做初步根因分析(若上面已經有多模型分析結果,直接沿用並視需要補充即可)。"
     )
-    stage1_ctx = StageContext(cwd=cwd, stage="stage1_immediate", bash_whitelist=req.escalation.stage1_allowed_tools)
+    stage1_ctx = StageContext(
+        cwd=cwd, stage="stage1_immediate", bash_whitelist=req.escalation.stage1_allowed_tools
+    )
     raw1 = await run_stage("stage1_immediate", req, stage1_prompt, stage1_ctx)
     stage1 = parse_stage("stage1_immediate", raw1)
     resolved_after_1 = await asyncio.to_thread(verify_resolved, req)
@@ -244,7 +246,9 @@ async def escalate(req: EscalateRequest) -> EscalationReport:
             "連線池大小、記憶體限制等)。你只能編輯以下設定檔,不要修改其他任何檔案:\n"
             f"{files_list}\n\n若判斷不需要調整,action_taken 請填 \"none\"。"
         )
-        stage2_ctx = StageContext(cwd=cwd, stage="stage2_parameter", editable_files=req.escalation.stage3_config_files)
+        stage2_ctx = StageContext(
+            cwd=cwd, stage="stage2_parameter", editable_files=req.escalation.stage3_config_files
+        )
         raw2 = await run_stage("stage2_parameter", req, stage2_prompt, stage2_ctx)
         stage2 = parse_stage("stage2_parameter", raw2)
         resolved_after_2 = await asyncio.to_thread(verify_resolved, req)

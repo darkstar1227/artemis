@@ -113,5 +113,10 @@ async def main():
     print("\nPASS: non-whitelisted bash command was correctly rejected by the in-tool guard")
 
 
+def test_permission_denial():
+    """pytest entry point — same coroutine the script runs via __main__."""
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     asyncio.run(main())

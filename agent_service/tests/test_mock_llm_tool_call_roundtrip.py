@@ -139,5 +139,10 @@ async def main():
     print("\nPASS: real tool-call round trip through Agent/Runner/StageContext verified")
 
 
+def test_tool_call_roundtrip():
+    """pytest entry point — same coroutine the script runs via __main__."""
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     asyncio.run(main())

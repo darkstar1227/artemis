@@ -176,5 +176,10 @@ async def main():
         print("\nPASS: stage3 agent successfully used list_dir and grep_files against a real temp project")
 
 
+def test_explore_tools():
+    """pytest entry point — same coroutine the script runs via __main__."""
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     asyncio.run(main())

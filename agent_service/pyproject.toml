@@ -8,3 +8,29 @@ dependencies = [
     "pydantic>=2.13.5",
     "uvicorn[standard]>=0.53.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pylint>=3.3.0",
+    "pytest>=8.3.0",
+]
+
+[tool.pylint.main]
+max-line-length = 110
+
+[tool.pylint."messages control"]
+# missing-*-docstring: this codebase deliberately writes no docstrings (names
+# carry the "what", CLAUDE.md/comments carry the non-obvious "why" only).
+# broad-exception-caught: several call sites intentionally catch Exception to
+# degrade gracefully instead of ever blocking the pipeline (documented in
+# CLAUDE.md) — that's a design choice, not an oversight pylint should flag.
+# subprocess-run-check: every subprocess.run() here inspects returncode/stdout
+# itself rather than wanting an exception on nonzero exit.
+disable = [
+    "missing-module-docstring",
+    "missing-class-docstring",
+    "missing-function-docstring",
+    "broad-exception-caught",
+    "subprocess-run-check",
+    "too-many-locals",
+]

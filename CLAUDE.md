@@ -43,21 +43,34 @@ uv run --project analyzer analyzer/analyze.py incidents/<id>.json --project-root
 ```
 
 There is no Rust test suite yet; validate `src/` changes by running `cargo build` and doing a manual
-`watch` smoke test against a small script that crashes/prints an error pattern. `agent_service/` has
-a minimal smoke-test suite (`agent_service/tests/`, plain scripts, no pytest dependency) that spins
-up a fake OpenAI-compatible `/chat/completions` server and drives the real `pipeline.escalate()`
-through it — this is the only place the SDK's tool-calling round trip and the permission guards are
-actually exercised against a real (mocked) LLM rather than just import-checked:
+`watch` smoke test against a small script that crashes/prints an error pattern. CI (`.github/
+workflows/rust.yml`) runs `cargo build`/`cargo test` on every push/PR.
+
+`agent_service/` has a minimal smoke-test suite (`agent_service/tests/`) that spins up a fake
+OpenAI-compatible `/chat/completions` server and drives the real `pipeline.escalate()` through it —
+this is the only place the SDK's tool-calling round trip and the permission guards are actually
+exercised against a real (mocked) LLM rather than just import-checked. Each test file is both a
+plain runnable script (`if __name__ == "__main__"`) and pytest-discoverable (a thin `test_*()`
+wrapper around the same `main()` coroutine), so `uv run python tests/test_foo.py` and `uv run
+pytest tests/` do the same thing:
 
 ```bash
 cd agent_service
+uv sync --all-groups                                          # installs pytest/pylint dev deps too
 uv run python -c "import main"                              # import/syntax check
-uv run python tests/test_mock_llm_tool_call_roundtrip.py    # whitelisted tool call executes correctly
-uv run python tests/test_mock_llm_permission_denial.py      # non-whitelisted tool call is rejected
-uv run python tests/test_mock_llm_explore_tools.py          # stage3 list_dir/grep_files actually work
+uv run pytest tests/ -v                                      # runs all three smoke tests above
+uv run pylint main.py tools.py agents_def.py pipeline.py schemas.py central.py  # lint (10/10 gate)
 uv run uvicorn main:app --port 8787                          # then curl -X POST /escalate — see
                                                                # agent_client.rs for the request shape
 ```
+
+CI (`.github/workflows/agent_service.yml`) runs the import check, `pytest`, and `pylint` on every
+push/PR touching `agent_service/`. `pylint` is scoped to the service source files only — the test
+scripts under `tests/` intentionally duplicate mock-server boilerplate across files (each one needs
+to stay a self-contained, individually runnable script) and would otherwise trip
+`duplicate-code`. `[tool.pylint]` in `agent_service/pyproject.toml` disables checks that fight this
+codebase's own conventions (no docstrings; `except Exception` used deliberately in several places to
+degrade gracefully rather than ever block the pipeline — see below).
 
 Unreachable/failing model calls degrade gracefully rather than crashing the service — verify that
 by pointing `execution_base_url`/`orchestrator.base_url` at a port nothing is listening on.

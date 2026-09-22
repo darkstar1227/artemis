@@ -86,8 +86,11 @@ docker compose up -d
 cargo build                                   # Rust side
 
 cd agent_service
+uv sync --all-groups                          # installs pytest/pylint dev deps
 uv run python -c "import main"                # import/syntax check
-uv run python tests/test_mock_llm_tool_call_roundtrip.py   # whitelisted tool calls execute correctly
-uv run python tests/test_mock_llm_permission_denial.py     # non-whitelisted tool calls are rejected
-uv run python tests/test_mock_llm_explore_tools.py          # stage3 list_dir/grep_files actually work
+uv run pytest tests/ -v                       # mock-LLM smoke tests
+uv run pylint main.py tools.py agents_def.py pipeline.py schemas.py central.py  # lint
 ```
+
+CI runs `cargo build`/`cargo test` (`.github/workflows/rust.yml`) and the `agent_service` checks
+above (`.github/workflows/agent_service.yml`) on every push/PR.

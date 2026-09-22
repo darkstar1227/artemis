@@ -85,7 +85,10 @@ def record(push: IncidentPush) -> None:
 def list_incidents(
     host_id: str | None = None, project: str | None = None, limit: int = 100
 ) -> list[IncidentSummary]:
-    query = "SELECT host_id, project, incident_id, message, timestamp, final_resolved, received_at FROM incidents"
+    query = (
+        "SELECT host_id, project, incident_id, message, timestamp, final_resolved, received_at "
+        "FROM incidents"
+    )
     clauses = []
     params: list[str] = []
     if host_id:
