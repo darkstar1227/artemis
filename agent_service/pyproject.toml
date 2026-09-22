@@ -1,0 +1,10 @@
+[project]
+name = "artemis-agent-service"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.141.1",
+    "openai-agents>=0.22.3",
+    "pydantic>=2.13.5",
+    "uvicorn[standard]>=0.53.0",
+]

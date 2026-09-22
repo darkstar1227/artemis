@@ -1,0 +1,9 @@
+[project]
+name = "artemis-analyzer"
+version = "0.1.0"
+description = "Artemis autoheal 根因分析腳本(由 Rust 核心以 uv run 呼叫)"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
