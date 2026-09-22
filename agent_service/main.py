@@ -10,10 +10,11 @@ import hmac
 import logging
 import os
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
+import central
 from pipeline import escalate
-from schemas import EscalateRequest, EscalationReport
+from schemas import EscalateRequest, EscalationReport, IncidentPush, IncidentSummary
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("artemis-agent-service")
@@ -56,3 +57,33 @@ async def escalate_endpoint(req: EscalateRequest) -> EscalationReport:
         "escalate done: incident=%s final_resolved=%s", req.incident.get("id"), report.final_resolved
     )
     return report
+
+
+# ---------------------------------------------------------------------------
+# 多主機事件彙整(central collector)。與上面的 escalation pipeline 無關 —
+# 這裡純粹是讓多台 host 各自跑的 `artemis watch` 有一個共同的地方可以查詢
+# 所有專案的事件,不論該 host 有沒有開 escalation。見 src/central_client.rs。
+# ---------------------------------------------------------------------------
+
+
+@app.post("/incidents", dependencies=[Depends(_require_auth)])
+async def push_incident(push: IncidentPush) -> dict:
+    central.record(push)
+    return {"status": "ok"}
+
+
+@app.get("/incidents", response_model=list[IncidentSummary], dependencies=[Depends(_require_auth)])
+async def list_incidents_endpoint(
+    host_id: str | None = Query(default=None),
+    project: str | None = Query(default=None),
+    limit: int = Query(default=100, le=1000),
+) -> list[IncidentSummary]:
+    return central.list_incidents(host_id=host_id, project=project, limit=limit)
+
+
+@app.get("/incidents/{host_id}/{incident_id}", dependencies=[Depends(_require_auth)])
+async def get_incident_endpoint(host_id: str, incident_id: str) -> dict:
+    result = central.get_incident(host_id, incident_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="incident not found")
+    return result

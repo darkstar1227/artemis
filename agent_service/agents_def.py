@@ -13,7 +13,7 @@ from functools import lru_cache
 from agents import Agent, AsyncOpenAI, ModelSettings, OpenAIChatCompletionsModel
 
 from schemas import AgentRoleConfig, EscalationSettings, OrchestratorConfig
-from tools import StageContext, edit_file, read_file, run_bash, write_file
+from tools import StageContext, edit_file, grep_files, list_dir, read_file, run_bash, write_file
 
 JUDGMENT_ROLE_PROMPTS = {
     "risk_analysis": "你是風險分析專家 agent。針對給定的事件,評估這次修復動作可能造成的風險" \
@@ -109,11 +109,19 @@ def build_stage_agent(stage: str, esc: EscalationSettings, orch: OrchestratorCon
         tools = [run_bash]
         extra = "你只能使用白名單內的 Bash 指令做安全動作(例如重啟/清理暫存),絕對不能修改任何程式碼。"
     elif stage == "stage2_parameter":
-        tools = [read_file, edit_file]
-        extra = "你只能編輯明確允許的設定檔,不要修改其他任何檔案或執行指令。"
+        tools = [read_file, edit_file, list_dir, grep_files]
+        extra = (
+            "你只能編輯明確允許的設定檔,不要修改其他任何檔案或執行指令。"
+            "若不確定設定檔的確切路徑或相關程式碼位置,可以用 list_dir/grep_files 先探索,"
+            "不要用臆測的路徑直接呼叫 read_file/edit_file。"
+        )
     else:  # stage3_code_fix
-        tools = [read_file, edit_file, write_file, run_bash]
-        extra = "你可以讀寫任何相關檔案、執行指令來驗證修復,但絕對不要執行 git commit 或 git push。"
+        tools = [read_file, edit_file, write_file, run_bash, list_dir, grep_files]
+        extra = (
+            "你可以讀寫任何相關檔案、執行指令來驗證修復,但絕對不要執行 git commit 或 git push。"
+            "若不確定根因所在的確切檔案,可以先用 list_dir/grep_files 探索專案結構與相關程式碼,"
+            "不要用臆測的路徑直接呼叫 read_file。"
+        )
 
     return Agent(
         name=stage,

@@ -34,6 +34,19 @@ from tools import StageContext
 
 _JSON_BLOCK_RE = re.compile(r"```json(.*?)```", re.DOTALL)
 
+# 事件內容會被嵌進「每一個」stage/judgment agent 的 prompt 裡(stage0 分析 + stage1~3
+# 執行,各自都是獨立的 Runner.run 呼叫),沒有上限的話一個巨大的原始輸出或超長堆疊會
+# 讓每一次呼叫都重複付出同樣的 context/token 成本。上限與 tools.py::READ_FILE_MAX_CHARS
+# 採同樣量級,同樣附上可辨識的截斷標記而不是靜默丟資料。
+INCIDENT_RAW_MAX_CHARS = 20000
+INCIDENT_FRAMES_MAX = 50
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n\n[已截斷,原始長度 {len(text)} 字元,只顯示前 {max_chars} 字元]"
+
 
 def extract_json_block(text: str) -> dict | None:
     """Grab the LAST fenced ```json block in the text — same convention the
@@ -49,13 +62,16 @@ def extract_json_block(text: str) -> dict | None:
 
 def incident_context(incident: dict) -> str:
     frames = incident.get("frames") or []
-    frame_lines = "\n".join(f"  - {f.get('raw', '')}" for f in frames)
+    frame_lines = "\n".join(f"  - {f.get('raw', '')}" for f in frames[:INCIDENT_FRAMES_MAX])
+    if len(frames) > INCIDENT_FRAMES_MAX:
+        frame_lines += f"\n  ...(還有 {len(frames) - INCIDENT_FRAMES_MAX} 行堆疊/事件內容,已截斷)"
+    raw = _truncate(incident.get("raw", "") or "", INCIDENT_RAW_MAX_CHARS)
     return (
         f"專案:{incident.get('project')}\n"
         f"來源:{incident.get('source')}\n"
         f"錯誤訊息:{incident.get('message')}\n"
         f"堆疊/相關內容:\n{frame_lines}\n"
-        f"原始輸出:\n{incident.get('raw', '')}"
+        f"原始輸出:\n{raw}"
     )
 
 
@@ -174,10 +190,12 @@ def verify_resolved(req: EscalateRequest) -> bool:
 
 async def run_stage(stage: str, req: EscalateRequest, prompt: str, stage_ctx: StageContext) -> str:
     agent = build_stage_agent(stage, req.escalation, req.orchestrator)
+    # stage2/stage3 現在多了 list_dir/grep_files 可以先探索再動手,比純粹用 read_file
+    # 猜路徑多花 1~2 輪,30 留一點餘裕但仍是硬上限,避免 agent 無止盡繞圈。
     timeout = max(req.orchestrator.timeout_secs, 180)
     try:
         result = await asyncio.wait_for(
-            Runner.run(agent, prompt, context=stage_ctx, max_turns=20), timeout=timeout
+            Runner.run(agent, prompt, context=stage_ctx, max_turns=30), timeout=timeout
         )
         return result.final_output or ""
     except Exception as e:  # noqa: BLE001

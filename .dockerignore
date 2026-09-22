@@ -1,0 +1,7 @@
+.git
+target
+incidents
+artemis.toml
+analyzer/.venv
+analyzer/__pycache__
+agent_service

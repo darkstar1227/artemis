@@ -93,3 +93,24 @@ class EscalationReport(BaseModel):
     stage3_code_fix: Optional[StageResult] = None
     final_resolved: bool = False
     code_diff: Optional[str] = None
+
+
+class IncidentPush(BaseModel):
+    """Body of POST /incidents — a host's best-effort push of one recorded
+    incident to the central collector, independent of whether escalation is
+    enabled on that host."""
+
+    host_id: str
+    project: str
+    incident: dict[str, Any]
+    report_markdown: Optional[str] = None
+
+
+class IncidentSummary(BaseModel):
+    host_id: str
+    project: str
+    incident_id: str
+    message: str
+    timestamp: str
+    final_resolved: Optional[bool] = None
+    received_at: str

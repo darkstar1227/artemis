@@ -1,5 +1,6 @@
 mod agent_client;
 mod ai;
+mod central_client;
 mod config;
 mod incident;
 mod matcher;

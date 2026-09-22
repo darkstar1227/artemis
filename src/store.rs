@@ -1,4 +1,5 @@
 use crate::agent_client;
+use crate::central_client;
 use crate::config::Config;
 use crate::incident::Incident;
 use anyhow::{Context, Result};
@@ -48,6 +49,13 @@ impl Store {
 
         if let Err(e) = self.run_analyzer(&json_path, cfg) {
             eprintln!("[artemis] 根因分析執行失敗,已保留原始事件 JSON:{e}");
+        }
+
+        if cfg.central.enabled {
+            let report_markdown = fs::read_to_string(self.report_path(&incident.id)).ok();
+            if let Err(e) = central_client::push(&incident, report_markdown.as_deref(), cfg) {
+                eprintln!("[artemis] 推送事件到 central collector 失敗,不影響本機記錄:{e}");
+            }
         }
 
         Ok(json_path)

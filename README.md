@@ -1,74 +1,93 @@
 # Artemis
 
-**Agent 版 autoheal** — 監控伺服器/專案的執行程序,即時偵測 crash、錯誤 log、系統資源異常,自動記錄成結構化事件,並由多模型 AI agent 分級判斷、嘗試修復,最後產出人類可讀的根因分析報告。
+**Agent-based autoheal** — monitor server/project execution processes, detect crashes and error logs and system resource anomalies in real-time, automatically record them as structured incidents, and have multi-model AI agents make tiered judgments and attempt repairs, ultimately producing human-readable root-cause analysis reports.
 
-不是一套固定規則的重啟工具,而是一個會自己判斷「現在該做什麼處置」的 agent harness:先分析根因與風險,再決定要不要動手,動手的話又該從最保守的處置開始,一路到程式碼層級的暫時修復,每一步都會驗證是否已解決,絕不會自動 commit 或 push。
+Not a fixed-rule restart tool, but an agent harness that can judge for itself "what should be done now": first analyze root cause and risk, then decide whether to act, and if acting should start from the most conservative remedy and proceed all the way to temporary code-level fixes, with verification after each step to check if resolved, and never auto-commit or push.
 
-## 特色
+## Features
 
-- **三種偵測來源**:監控程序(crash / stdout·stderr 錯誤模式)、額外的 log 檔案、系統資源(CPU / 記憶體 / 磁碟)。
-- **四層分級自主處置**:即時處置(安全的重啟/清理)→ 伺服器參數調整 → 程式碼層級暫時修復,每層都有嚴格的權限白名單,且每層之後都會驗證是否已解決,解決了就不會往下一層繼續。
-- **多模型 orchestrator**:事件發生時先動態派遣風險分析、安全性分析、快速修復分析、log 分析、根因分析等 agent 進行判斷,再彙整出處置建議,不是每個事件都會跑滿全部流程。
-- **任何 OpenAI-compatible provider**:透過 [LiteLLM](https://github.com/BerriAI/litellm) 或任何 OpenAI-compatible endpoint,不同角色、不同層級可以各自指定不同的模型與 provider。
-- **可延伸到任何 repo**:`artemis onboard <repo>` 會實際掃描目標專案(README、CLAUDE.md、路由設定等),由 AI 判斷出安全的監控/處置設定並生成設定檔,而不是要你手刻。
-- **不需要 Claude Code CLI**:判斷層與執行層都建立在 [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) 上,自建檔案讀寫/bash 執行工具與分級權限白名單機制。
+- **Three detection sources**: process monitoring (crash / stdout·stderr error patterns), additional log files, system resources (CPU / memory / disk).
+- **Four-tier staged autonomous remediation**: immediate disposition (safe restart/cleanup) → server parameter tuning → code-level temporary fixes, each tier has strict permission whitelisting, and verification occurs after each tier to check if resolved; if resolved it will not proceed to the next tier.
+- **Multi-model orchestrator**: when an incident occurs, dynamically dispatch risk analysis, security analysis, quick fix analysis, log analysis, root cause analysis and other agents to make judgments, then synthesize remediation recommendations; not every incident runs through the complete pipeline.
+- **Any OpenAI-compatible provider**: via [LiteLLM](https://github.com/BerriAI/litellm) or any OpenAI-compatible endpoint, different roles and tiers can each specify different models and providers.
+- **Extensible to any repo**: `artemis onboard <repo>` will actually scan the target project (README, CLAUDE.md, route configurations, etc.), have AI determine safe monitoring/remediation settings and generate config files, rather than requiring you to hand-code them.
+- **No Claude Code CLI needed**: both the judgment and execution layers are built on the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python), with self-built file read/write/bash execution tools and tiered permission whitelisting mechanisms.
 
-## 架構
+## Architecture
 
 ```
 ┌─────────────────────────┐        HTTP (local)        ┌──────────────────────────┐
-│   Rust 偵測/監控層         │ ──────────────────────────▶ │  agent_service (Python)   │
-│   supervisor / watcher /  │   POST /escalate            │  OpenAI Agents SDK        │
-│   resource → Store        │ ◀────────────────────────── │  Stage 0~3 判斷 + 執行     │
-└─────────────────────────┘        EscalationReport       └──────────────────────────┘
+│   Rust detection/        │ ──────────────────────────▶ │  agent_service (Python)   │
+│   monitoring layer        │   POST /escalate            │  OpenAI Agents SDK        │
+│   supervisor/watcher/     │ ◀────────────────────────── │  Stage 0~3 judgment +     │
+│   resource → Store        │        EscalationReport      │  execution                │
+└─────────────────────────┘                             └──────────────────────────┘
             │
             ▼
-   incidents/<id>.json  →  analyzer/ (stdlib-only) →  incidents/<id>.md 根因報告
+   incidents/<id>.json  →  analyzer/ (stdlib-only) →  incidents/<id>.md root-cause report
 ```
 
-- Rust 端(`src/`)是常駐的偵測/監控層,`artemis.toml` 是設定的唯一真相來源。偵測到事件時透過本機 HTTP 呼叫 `agent_service`。
-- `agent_service/`(Python,`uv` 管理)是無狀態服務,負責判斷(orchestrator + 專科分析 agent)與執行(stage1~3 的實際檔案/bash 操作),每個 stage 的 Agent 只會拿到它該有的工具,再加上 in-tool 的白名單檢查(`agent_service/tools.py`)。
-- `analyzer/`(stdlib-only Python script)負責把 JSON 事件轉成附上原始碼上下文與 `git blame` 的 Markdown 根因報告。
+- The Rust side (`src/`) is the resident detection/monitoring layer; `artemis.toml` is the single source of truth for configuration. When an incident is detected, it calls `agent_service` over local HTTP.
+- `agent_service/` (Python, managed by `uv`) is a stateless service responsible for judgment (orchestrator + specialist analysis agents) and execution (actual file/bash operations in stage1~3); each stage's Agent only receives the tools it should have, plus in-tool whitelisting checks (`agent_service/tools.py`).
+- `analyzer/` (stdlib-only Python script) is responsible for converting JSON incidents into Markdown root-cause reports with source code context and `git blame`.
 
-詳細的技術架構、資料流與各檔案職責見 [CLAUDE.md](CLAUDE.md)。
+See [CLAUDE.md](CLAUDE.md) for detailed technical architecture, data flow, and file responsibilities.
 
-## 安裝需求
+## Installation Requirements
 
-- Rust(`cargo`)
-- Python 3.14+ 與 [`uv`](https://github.com/astral-sh/uv)
-- 一個 OpenAI-compatible 的模型端點(例如自架 [LiteLLM](https://github.com/BerriAI/litellm) gateway,或直接用任一 provider 的 API)
+- Rust (`cargo`)
+- Python 3.14+ and [`uv`](https://github.com/astral-sh/uv)
+- An OpenAI-compatible model endpoint (e.g., self-hosted [LiteLLM](https://github.com/BerriAI/litellm) gateway, or any provider's API)
 
-## 快速開始
+## Quick Start
 
 ```bash
-# 1. 建置
+# 1. Build
 cargo build --release
 
-# 2. 幫目標 repo 產生設定(AI 會實際讀過該 repo 再判斷監控/處置設定,並印出摘要供確認)
+# 2. Generate configuration for target repo (AI will read the repo and determine monitoring/remediation settings, then print a summary for confirmation)
 cargo run -- onboard <repo-path>
 
-# 3. 啟動 agent_service(判斷 + 執行層,watch 時需要它在背景跑)
+# 3. Start agent_service (judgment + execution layer, it needs to run in the background during watch)
 cd agent_service && uv run uvicorn main:app --port 8787
 
-# 4. 另開一個 terminal,開始監控
+# 4. Open another terminal and start monitoring
 cargo run -- watch --config configs/<repo-name>.toml
 
-# 查看已記錄的事件
+# View recorded incidents
 cargo run -- list
 cargo run -- show <incident-id>
 ```
 
-## 安全性
+## Multi-host / Multi-project / Docker
 
-`agent_service` 會依請求對目標 repo 執行 bash 指令與檔案讀寫,預設只綁定在 `127.0.0.1`。若要對外開放(例如 `--host 0.0.0.0`),務必在 `[agent_service]` 設定 `token_env` 並在 `agent_service` 執行環境中設定對應的 `ARTEMIS_AGENT_SERVICE_TOKEN`,否則任何連得到這個 port 的人都能讓它對這個 repo 執行任意指令。每一層(stage1~3)也各自有獨立的權限範圍(bash 白名單 / 可編輯檔案清單 / 禁止 `git commit`·`git push`),細節見 [CLAUDE.md](CLAUDE.md#agent_service-agent_service)。
+A single `artemis watch` process only monitors one `artemis.toml` (= one project). To manage multiple servers/projects simultaneously:
 
-## 測試
+1. For each project, first use `artemis onboard <repo-path>` to generate its own `configs/<name>.toml` (which is a tailored monitoring/remediation setting for that project, i.e., an independent agent team).
+2. All projects share the **same** `agent_service` (it is stateless by nature; judgment/execution logic depends entirely on request content).
+3. To query incidents from all hosts and projects in one place, add `[central]` (`enabled = true`, pointing to the same `agent_service`) in each project's configuration — each time `Store::record` records an incident, it also pushes a copy over, regardless of whether that project has `escalation` enabled, and push failures never affect local recording. Query methods: `GET /incidents?host_id=&project=`, `GET /incidents/{host_id}/{incident_id}`.
+
+Docker: `Dockerfile` (repo root) builds the `artemis` monitoring binary; `agent_service/Dockerfile` builds the judgment/execution/synthesis service. `docker-compose.example.yml` demonstrates a shared `agent_service` + one `artemis watch` container per project:
 
 ```bash
-cargo build                                   # Rust 端
+docker build -t artemis .
+docker build -t artemis-agent-service ./agent_service
+cp docker-compose.example.yml docker-compose.yml   # Copy, then modify based on number of projects
+docker compose up -d
+```
+
+## Security
+
+`agent_service` will execute bash commands and read/write files on the target repo based on requests; by default it only binds to `127.0.0.1`. If you need to expose it externally (e.g., `--host 0.0.0.0`), you must set `token_env` in `[agent_service]` and set the corresponding `ARTEMIS_AGENT_SERVICE_TOKEN` in the `agent_service` execution environment; otherwise anyone who can reach this port can make it execute arbitrary commands on this repo. Each tier (stage1~3) also has its own independent permission scope (bash whitelist / editable file list / prohibition of `git commit`·`git push`); see [CLAUDE.md](CLAUDE.md#agent_service-agent_service) for details.
+
+## Testing
+
+```bash
+cargo build                                   # Rust side
 
 cd agent_service
-uv run python -c "import main"                # import/語法檢查
-uv run python tests/test_mock_llm_tool_call_roundtrip.py   # 白名單內的工具呼叫可正確執行
-uv run python tests/test_mock_llm_permission_denial.py     # 白名單外的工具呼叫會被拒絕
+uv run python -c "import main"                # import/syntax check
+uv run python tests/test_mock_llm_tool_call_roundtrip.py   # whitelisted tool calls execute correctly
+uv run python tests/test_mock_llm_permission_denial.py     # non-whitelisted tool calls are rejected
+uv run python tests/test_mock_llm_explore_tools.py          # stage3 list_dir/grep_files actually work
 ```

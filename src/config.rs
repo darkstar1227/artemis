@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(default)]
     pub agent_service: AgentServiceConfig,
     #[serde(default)]
+    pub central: CentralConfig,
+    #[serde(default)]
     pub orchestrator: OrchestratorConfig,
     #[serde(default)]
     pub agents: AgentsConfig,
@@ -158,6 +160,53 @@ fn default_agent_service_url() -> String {
 }
 fn default_agent_service_timeout_secs() -> u64 {
     600
+}
+
+/// 多主機事件彙整(選用)。啟用後,每次 `Store::record` 都會盡力把這筆事件
+/// (JSON + 已產生的 Markdown 報告)推到一個共用的 collector(可以就是
+/// agent_service 本身,它同時提供 /escalate 與 /incidents),不論這台 host
+/// 有沒有開 escalation。推送失敗只會記 log,絕不影響本機事件記錄。
+#[derive(Debug, Deserialize, Clone)]
+pub struct CentralConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_central_collector_url")]
+    pub collector_url: String,
+    #[serde(default = "default_central_host_id")]
+    pub host_id: String,
+    #[serde(default)]
+    pub token_env: Option<String>,
+}
+
+impl Default for CentralConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            collector_url: default_central_collector_url(),
+            host_id: default_central_host_id(),
+            token_env: None,
+        }
+    }
+}
+
+fn default_central_collector_url() -> String {
+    "http://127.0.0.1:8787".into()
+}
+fn default_central_host_id() -> String {
+    hostname()
+}
+
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown-host".to_string())
 }
 
 /// 多模型 orchestrator 設定:事件發生時,先呼叫 orchestrator model(透過
@@ -367,6 +416,16 @@ timeout_secs = 600
 # 若 agent_service 綁定在 127.0.0.1(預設)以外的位址,務必設定這個欄位並在
 # agent_service 端匯出同名環境變數 ARTEMIS_AGENT_SERVICE_TOKEN,否則任何能
 # 連到這個服務的人都可以叫它對這個 repo 執行任意 bash / 寫入任意檔案。
+# token_env = "ARTEMIS_AGENT_SERVICE_TOKEN"
+
+# 多主機事件彙整(選用):啟用後每筆事件都會推一份到共用的 collector
+# (可以直接指到 agent_service,它同時提供 /escalate 與 /incidents),不論
+# 這台 host 有沒有開 escalation。用於多伺服器/多專案時有一個共同查詢入口。
+[central]
+enabled = false
+collector_url = "http://127.0.0.1:8787"
+# host_id 預設用系統 hostname,多台機器建議明確指定以利辨識
+# host_id = "prod-web-01"
 # token_env = "ARTEMIS_AGENT_SERVICE_TOKEN"
 
 # 多模型 agent harness:事件發生時,先由 orchestrator model 動態決定要派哪些

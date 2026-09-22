@@ -1,0 +1,39 @@
+# Example: one shared agent_service (judgment/execution layer + central
+# incident collector) plus one `artemis watch` container per project. Copy
+# this to docker-compose.yml, add a service block per project you want
+# monitored, and point each project's config at agent_service:8787 /
+# central collector at agent_service:8787.
+#
+# Each project needs its own configs/<name>.toml (generate with
+# `artemis onboard <repo-path>` first) with:
+#   [agent_service] url = "http://agent_service:8787"
+#   [central]        enabled = true, collector_url = "http://agent_service:8787"
+#   cwd pointed at /project (the mount path below)
+#
+# Set ARTEMIS_AGENT_SERVICE_TOKEN once you're binding agent_service beyond
+# localhost (docker-compose's internal network already isolates it somewhat,
+# but set a token if agent_service's port is published to the host/internet).
+
+services:
+  agent_service:
+    build: ./agent_service
+    ports:
+      - "8787:8787"
+    environment:
+      - ARTEMIS_AGENT_SERVICE_TOKEN=${ARTEMIS_AGENT_SERVICE_TOKEN:-}
+    volumes:
+      - agent_service_data:/app/data
+
+  # One block like this per monitored project. Duplicate + rename for more.
+  watch_example_project:
+    build: .
+    depends_on:
+      - agent_service
+    volumes:
+      - ./configs/example_project.toml:/app/artemis.toml:ro
+      - ./incidents/example_project:/app/incidents
+      - /path/to/example-project:/project:ro
+    command: ["watch", "--config", "/app/artemis.toml"]
+
+volumes:
+  agent_service_data:

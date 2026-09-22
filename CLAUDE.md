@@ -54,6 +54,7 @@ cd agent_service
 uv run python -c "import main"                              # import/syntax check
 uv run python tests/test_mock_llm_tool_call_roundtrip.py    # whitelisted tool call executes correctly
 uv run python tests/test_mock_llm_permission_denial.py      # non-whitelisted tool call is rejected
+uv run python tests/test_mock_llm_explore_tools.py          # stage3 list_dir/grep_files actually work
 uv run uvicorn main:app --port 8787                          # then curl -X POST /escalate — see
                                                                # agent_client.rs for the request shape
 ```
@@ -124,14 +125,22 @@ Execution (anything that touches files or processes) is done by **stage-specific
 (`agents_def.py::build_stage_agent`), each built with only the tool functions it should have —
 that's the permission model, replacing what Claude Code CLI's `--allowedTools`/`--disallowedTools`
 used to provide. Tools are self-implemented in `agent_service/tools.py` (`read_file`, `edit_file`,
-`write_file`, `run_bash`), all path-confined to `cwd`, with a `StageContext` (the Agents SDK run
-context) carrying the finer-grained scoping each stage needs:
+`write_file`, `run_bash`, `list_dir`, `grep_files`), all path-confined to `cwd`, with a
+`StageContext` (the Agents SDK run context) carrying the finer-grained scoping each stage needs.
+`list_dir`/`grep_files` are read-only exploration tools (grep skips `.git`/`node_modules`/`.venv`/
+`__pycache__`/`target`) added so stage2/stage3 agents can locate the right file instead of having to
+guess an exact path for `read_file` — both are capped (`LIST_DIR_MAX_ENTRIES`, `GREP_MAX_MATCHES`/
+`GREP_MAX_CHARS` in `tools.py`) for the same context-budget reason as `READ_FILE_MAX_CHARS` below:
 
 | Stage | Purpose | Tools given | In-tool guard |
 |---|---|---|---|
 | 1 — immediate disposition | safe mitigation (restart/cleanup) + draft root cause | `run_bash` only | `run_bash` rejects anything not exactly matching `escalation.stage1_allowed_tools` |
-| 2 — parameter tuning | adjust app/server config | `read_file`, `edit_file` | `edit_file`/`write_file` reject any path not in `escalation.stage3_config_files` |
-| 3 — code-level temporary fix | edit source, run tests | `read_file`, `edit_file`, `write_file`, `run_bash` | `run_bash` rejects any command containing `git commit`/`git push` |
+| 2 — parameter tuning | adjust app/server config | `read_file`, `edit_file`, `list_dir`, `grep_files` | `edit_file`/`write_file` reject any path not in `escalation.stage3_config_files` |
+| 3 — code-level temporary fix | edit source, run tests | `read_file`, `edit_file`, `write_file`, `run_bash`, `list_dir`, `grep_files` | `run_bash` rejects any command containing `git commit`/`git push` |
+
+`run_stage()`'s `max_turns` is 30 (`pipeline.py`) to leave room for a `list_dir`/`grep_files`
+exploration pass before the stage's actual read/edit/bash calls, while still being a hard cap so an
+agent can't loop indefinitely.
 
 Each stage is skipped if the previous stage's `verify_resolved()` check passed. `verify_resolved()`
 (now in `pipeline.py`, run off the event loop via `asyncio.to_thread`) runs
@@ -170,11 +179,13 @@ otherwise produce invalid TOML.
 `artemis.toml` (scaffolded by `artemis init` from `Config::EXAMPLE`) is the single source of truth;
 there are no env-var overrides — API keys for LiteLLM/providers are read from an env var *name*
 configured in TOML (`api_key_env`), never stored in the file itself. Notable nesting: `[resources]`,
-`[escalation]`, `[agent_service]`, `[orchestrator]` and `[agents.*]` are all optional tables with
-their own defaults, so a minimal config only needs `command`. `[agent_service]` (`url`,
+`[escalation]`, `[agent_service]`, `[central]`, `[orchestrator]` and `[agents.*]` are all optional
+tables with their own defaults, so a minimal config only needs `command`. `[agent_service]` (`url`,
 `timeout_secs`, optional `token_env`) is where the Python service's HTTP endpoint lives —
 `token_env` names an env var holding a bearer token, only needed if `agent_service` is bound beyond
-`127.0.0.1` (see the agent_service section below). `[escalation]` no longer has
+`127.0.0.1` (see the agent_service section below). `[central]` (`enabled`, `collector_url`,
+`host_id`, optional `token_env`) is the multi-host incident push described below — independent of
+`[escalation]`. `[escalation]` no longer has
 `claude_bin`/`model` (those were Claude Code CLI-specific); it instead has optional
 `execution_model`/`execution_base_url`/`execution_api_key_env` for stage1~3's model, falling back to
 `[orchestrator]`'s settings when unset.
@@ -195,14 +206,17 @@ Python, `uv`-managed, built on the **OpenAI Agents SDK**. Files:
 
 - `schemas.py` — pydantic models for the `/escalate` request/response, mirroring the Rust structs
   above field-for-field so the JSON on both sides stays a straightforward 1:1 mapping.
-- `tools.py` — the self-built `read_file`/`edit_file`/`write_file`/`run_bash` tool functions plus
-  `StageContext` (the per-run permission scope) and the path/whitelist/git-commit guards described
-  above.
+- `tools.py` — the self-built `read_file`/`edit_file`/`write_file`/`run_bash`/`list_dir`/
+  `grep_files` tool functions plus `StageContext` (the per-run permission scope) and the
+  path/whitelist/git-commit guards described above.
 - `agents_def.py` — builds `Agent`/`OpenAIChatCompletionsModel` instances from the request's config,
   one per judgment role and one per stage; `model_for()` is where per-role/per-stage
   `base_url`/`api_key_env` overrides turn into a distinct `AsyncOpenAI` client.
 - `pipeline.py` — the actual Stage 0~3 flow (`escalate()`), `extract_json_block`/`incident_context`
-  helpers, and `verify_resolved()`.
+  helpers, and `verify_resolved()`. `incident_context()` truncates the incident's raw output/frames
+  (`INCIDENT_RAW_MAX_CHARS`/`INCIDENT_FRAMES_MAX`) before embedding it into every stage/judgment
+  prompt — same rationale as `READ_FILE_MAX_CHARS` below, but this one matters more because a
+  single incident's context gets re-embedded into several independent `Runner.run()` calls.
 - `main.py` — the FastAPI app (`GET /health`, `POST /escalate`).
 - `tests/` — mock-LLM smoke tests (see Commands above); not part of the shipped service.
 
@@ -218,7 +232,32 @@ token_env` names an env var it can read (`src/agent_client.rs`). **If you ever b
 beyond `127.0.0.1`** (e.g. `--host 0.0.0.0`), set this token on both sides — otherwise anyone who can
 reach the port can make it run arbitrary commands against the target repo. `read_file` also caps
 returned content at `tools.py::READ_FILE_MAX_CHARS` (20,000 chars, truncated with a marker) so a
-large/binary file can't blow up an agent's context window or cost.
+large/binary file can't blow up an agent's context window or cost; `list_dir`/`grep_files` have
+their own caps (`LIST_DIR_MAX_ENTRIES`, `GREP_MAX_MATCHES`/`GREP_MAX_CHARS`) for the same reason.
+
+### Multi-host / multi-project (src/central_client.rs, agent_service/central.py)
+
+Each `artemis watch` process only supervises one `artemis.toml` (one project). To run many
+projects/hosts: `artemis onboard <repo>` per project gives each one its own tailored
+`configs/<name>.toml`; all of them can point `[agent_service]` at the *same* `agent_service`
+instance since it's stateless per-request. For a single place to query incidents across every
+host/project, set `[central] enabled = true` (+ `collector_url`, `host_id`, optional `token_env`)
+— `Store::record` best-effort-pushes every recorded incident (JSON + rendered Markdown) to
+`agent_service`'s `POST /incidents`, **independent of whether `escalation.enabled`** on that host; a
+push failure only logs, never affects local recording (`central_client::push`, same
+fire-and-forget philosophy as `agent_client::escalate`). `agent_service/central.py` persists pushes
+to a local SQLite file (`agent_service/data/central.db`, stdlib `sqlite3`, no new dependency) and
+`main.py` exposes `GET /incidents?host_id=&project=&limit=` and `GET
+/incidents/{host_id}/{incident_id}` (both behind the same bearer-token auth as `/escalate`).
+
+`Dockerfile` (repo root) builds the `artemis` binary; the runtime image also pre-provisions
+`analyzer`'s pinned Python interpreter and warms its venv at build time (`uv python install 3.14 &&
+uv run --project analyzer python3 -c ""`) so recording the first incident in a fresh container
+doesn't pay a ~30MB interpreter download. `agent_service/Dockerfile` builds the Python service.
+`docker-compose.example.yml` shows one shared `agent_service` + one `artemis watch` service per
+project. Both Dockerfiles have matching `.dockerignore`s — without them, a host-built `.venv` gets
+copied into the image with a broken interpreter symlink (harmless but forces a venv rebuild at
+container start).
 
 ### Python analyzer (analyzer/analyze.py)
 
