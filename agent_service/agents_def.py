@@ -12,8 +12,8 @@ from functools import lru_cache
 
 from agents import Agent, AsyncOpenAI, ModelSettings, OpenAIChatCompletionsModel
 
-from schemas import AgentRoleConfig, EscalationSettings, OrchestratorConfig
-from tools import edit_file, grep_files, list_dir, read_file, run_bash, write_file
+from schemas import AgentRoleConfig, EscalationSettings, OrchestratorConfig, RemoteConfig
+from tools import edit_file, grep_files, list_dir, read_file, remote_exec, run_bash, write_file
 
 JUDGMENT_ROLE_PROMPTS = {
     "risk_analysis": "你是風險分析專家 agent。針對給定的事件,評估這次修復動作可能造成的風險" \
@@ -99,15 +99,28 @@ STAGE_JSON_CONTRACT = (
 )
 
 
-def build_stage_agent(stage: str, esc: EscalationSettings, orch: OrchestratorConfig) -> Agent:
+def build_stage_agent(
+    stage: str, esc: EscalationSettings, orch: OrchestratorConfig, remote: RemoteConfig | None = None
+) -> Agent:
     model_name = esc.execution_model or orch.model
     base_url = esc.execution_base_url or orch.base_url
     api_key_env = esc.execution_api_key_env or orch.api_key_env
     model = model_for(model_name, base_url, api_key_env)
+    remote_enabled = bool(remote and remote.enabled and remote.device_id)
+    remote_note = (
+        "\n\n這台事件也設定了遠端主機,可以用 remote_exec 在該主機上執行指令" \
+        "(每次呼叫都會留下 request_id,任何人之後都能用 `sanc task`/`sanc output` 查回執行紀錄,"
+        "不用重新確認 SSH 能不能連線)。"
+        if remote_enabled
+        else ""
+    )
 
     if stage == "stage1_immediate":
-        tools = [run_bash]
-        extra = "你只能使用白名單內的 Bash 指令做安全動作(例如重啟/清理暫存),絕對不能修改任何程式碼。"
+        tools = [run_bash, remote_exec] if remote_enabled else [run_bash]
+        extra = (
+            "你只能使用白名單內的 Bash 指令做安全動作(例如重啟/清理暫存),絕對不能修改任何程式碼。"
+            + remote_note
+        )
     elif stage == "stage2_parameter":
         tools = [read_file, edit_file, list_dir, grep_files]
         extra = (
@@ -117,10 +130,13 @@ def build_stage_agent(stage: str, esc: EscalationSettings, orch: OrchestratorCon
         )
     else:  # stage3_code_fix
         tools = [read_file, edit_file, write_file, run_bash, list_dir, grep_files]
+        if remote_enabled:
+            tools.append(remote_exec)
         extra = (
             "你可以讀寫任何相關檔案、執行指令來驗證修復,但絕對不要執行 git commit 或 git push。"
             "若不確定根因所在的確切檔案,可以先用 list_dir/grep_files 探索專案結構與相關程式碼,"
             "不要用臆測的路徑直接呼叫 read_file。"
+            + remote_note
         )
 
     return Agent(

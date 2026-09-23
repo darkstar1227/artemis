@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,6 +25,7 @@ READ_FILE_MAX_CHARS = 20000
 LIST_DIR_MAX_ENTRIES = 500
 GREP_MAX_MATCHES = 200
 GREP_MAX_CHARS = 8000
+REMOTE_EXEC_MAX_CHARS = 8000
 _SKIP_DIR_NAMES = {".git", "node_modules", ".venv", "__pycache__", "target", ".mypy_cache"}
 
 
@@ -36,6 +38,15 @@ class StageContext:
     bash_whitelist: list[str] = field(default_factory=list)
     editable_files: list[str] = field(default_factory=list)  # empty = unrestricted
     forbid_git_commit_push: bool = False
+
+    # SessAnchor (`sanc`) 遠端執行後端,詳見 remote_exec。remote_enabled=False
+    # 或 remote_device 未設定時,remote_exec 直接回報錯誤,不會嘗試呼叫 sanc。
+    remote_enabled: bool = False
+    remote_device: str | None = None
+    sanc_bin: str = "sanc"
+    remote_state_dir: str | None = None
+    remote_timeout_secs: int = 120
+    remote_allowed_commands: list[str] = field(default_factory=list)
 
 
 class PermissionDenied(Exception):
@@ -62,11 +73,11 @@ def _check_editable(ctx: StageContext, path: str) -> None:
         )
 
 
-def _bash_command_allowed(ctx: StageContext, command: str) -> bool:
-    if not ctx.bash_whitelist:
+def _command_in_whitelist(whitelist: list[str], command: str) -> bool:
+    if not whitelist:
         return False
     stripped = command.strip()
-    for entry in ctx.bash_whitelist:
+    for entry in whitelist:
         # 設定檔沿用舊的 Claude CLI "Bash(實際指令)" 語法,這裡把包裝去掉來比對。
         allowed_cmd = entry.strip()
         if allowed_cmd.startswith("Bash(") and allowed_cmd.endswith(")"):
@@ -74,6 +85,10 @@ def _bash_command_allowed(ctx: StageContext, command: str) -> bool:
         if stripped == allowed_cmd.strip():
             return True
     return False
+
+
+def _bash_command_allowed(ctx: StageContext, command: str) -> bool:
+    return _command_in_whitelist(ctx.bash_whitelist, command)
 
 
 @function_tool
@@ -240,3 +255,67 @@ def run_bash(wrapper: RunContextWrapper[StageContext], command: str) -> str:
 
     out = f"exit_code={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     return out[:8000]
+
+
+def _sanc(ctx: StageContext, *args: str) -> subprocess.CompletedProcess:
+    cmd = [ctx.sanc_bin]
+    if ctx.remote_state_dir:
+        cmd += ["--state-dir", ctx.remote_state_dir]
+    cmd += list(args)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=ctx.remote_timeout_secs
+    )
+
+
+@function_tool
+def remote_exec(wrapper: RunContextWrapper[StageContext], command: str) -> str:
+    """在設定好的遠端主機上執行指令,透過 SessAnchor(`sanc`)。每次呼叫都會帶一個新的
+    request_id,執行紀錄(指令、輸出)之後任何人都可以用同一個 session/request_id 透過
+    `sanc output`/`sanc task` 查回來,不需要重新測試 SSH 是否能連線 — 交接時可以直接看
+    這個 session 之前跑過什麼。注意:目前的 sanc 版本還不保證連線中斷後遠端任務會繼續
+    (`sanc exec` 自己的說明是「No remote persistence on SSH loss yet」),這裡只是把
+    「這台主機之前執行過什麼」留下可查的紀錄,不是斷線續傳。
+
+    Args:
+        command: 要在遠端主機執行的 shell 指令。
+    """
+    ctx = wrapper.context
+    if not ctx.remote_enabled or not ctx.remote_device:
+        return "[錯誤] 此事件未啟用/設定遠端主機(remote.enabled / remote.device_id),無法執行 remote_exec"
+
+    if ctx.stage == "stage1_immediate":
+        if not _command_in_whitelist(ctx.remote_allowed_commands, command):
+            return f"[權限拒絕] 此階段只能對遠端主機執行白名單內的指令,拒絕:{command}"
+    elif ctx.forbid_git_commit_push and ("git commit" in command or "git push" in command):
+        return f"[權限拒絕] 此階段禁止 git commit / git push:{command}"
+
+    session_id = f"artemis-{ctx.remote_device}"
+    request_id = f"{ctx.stage}-{uuid.uuid4().hex[:12]}"
+
+    try:
+        # session create 若該 session 已存在會回傳非 0(prototype 階段沒有明確的
+        # "already exists" 訊息可比對),因此這裡採用「盡量建立,失敗就假設已存在並
+        # 繼續往下執行」的寬鬆策略,和 agent_client::escalate 對 agent_service
+        # 連不到時的 fire-and-forget/degrade-gracefully 風格一致。
+        _sanc(ctx, "session", "create", "--device", ctx.remote_device, session_id)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"[錯誤] 無法呼叫 sanc(檢查 sanc 是否已安裝並在 PATH 上):{e}"
+
+    try:
+        result = _sanc(
+            ctx, "exec", "--request-id", request_id, "--command", command, session_id
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"[錯誤] 遠端指令逾時({ctx.remote_timeout_secs}s):{command}"
+            f"(session={session_id}, request_id={request_id})"
+        )
+    except OSError as e:
+        return f"[錯誤] 無法呼叫 sanc:{e}"
+
+    out = (
+        f"device={ctx.remote_device} session={session_id} request_id={request_id}\n"
+        f"exit_code={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}\n\n"
+        f"[之後可用 `sanc task {request_id}` / `sanc output {request_id}` 查回這次執行的狀態與輸出]"
+    )
+    return out[:REMOTE_EXEC_MAX_CHARS]

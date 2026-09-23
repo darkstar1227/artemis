@@ -39,6 +39,8 @@ pub struct Config {
     pub orchestrator: OrchestratorConfig,
     #[serde(default)]
     pub agents: AgentsConfig,
+    #[serde(default)]
+    pub remote: RemoteConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -289,6 +291,50 @@ pub struct AgentsConfig {
     pub root_cause_analysis: AgentRoleConfig,
 }
 
+/// 遠端執行後端(選用),透過 [SessAnchor](https://github.com/) 的 `sanc` CLI 在
+/// 設定好的裝置上執行指令,讓 stage1/stage3 的動作不侷限在跑 agent_service 的這台
+/// 主機上。這是 agent_service 內部呼叫的 `sanc` 子行程,Rust 這裡只負責把設定轉發過
+/// 去 — 目前的 sanc 版本(prototype 階段)還不保證 SSH 斷線後遠端任務會繼續執行,
+/// 這個功能目前的價值是「留下可查的執行紀錄」與「不用每次都重新測試連線」,不是斷線續傳。
+#[derive(Debug, Deserialize, Clone)]
+pub struct RemoteConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 對應 `sanc device add/pin` 設定好的裝置 ID。
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default = "default_sanc_bin")]
+    pub sanc_bin: String,
+    /// 轉發給 `sanc --state-dir`,預設用 sanc 自己的 `$HOME/.local/state/sessanchor`。
+    #[serde(default)]
+    pub state_dir: Option<String>,
+    #[serde(default = "default_remote_timeout_secs")]
+    pub timeout_secs: u64,
+    /// 第一層(stage1)呼叫 remote_exec 時的白名單,語法比照 stage1_allowed_tools。
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device_id: None,
+            sanc_bin: default_sanc_bin(),
+            state_dir: None,
+            timeout_secs: default_remote_timeout_secs(),
+            allowed_commands: Vec::new(),
+        }
+    }
+}
+
+fn default_sanc_bin() -> String {
+    "sanc".into()
+}
+fn default_remote_timeout_secs() -> u64 {
+    120
+}
+
 fn default_name() -> String {
     "unnamed-project".into()
 }
@@ -455,5 +501,19 @@ model = "your-log-analysis-model"
 
 [agents.root_cause_analysis]
 model = "your-root-cause-analysis-model"
+
+# 遠端執行後端(選用):透過 SessAnchor(`sanc` CLI/MCP)讓 stage1/stage3 的
+# remote_exec 工具可以在設定好的裝置上執行指令,並用 sanc 自己的 session/
+# request_id 留下可查的執行紀錄(交接時不用重新確認 SSH 能不能連線)。
+# 目前 sanc 還是 prototype 階段,不保證斷線後遠端任務會持續。
+[remote]
+enabled = false
+# device_id = "prod-web-01"          # 需先用 `sanc device add` 設定好
+# sanc_bin = "sanc"                  # 預設從 PATH 找,也可指定完整路徑
+# state_dir = "/var/lib/sessanchor"  # 對應 sanc --state-dir,預設用 sanc 自己的預設值
+timeout_secs = 120
+allowed_commands = [
+    # "Bash(systemctl restart myapp)",
+]
 "#;
 }

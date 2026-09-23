@@ -26,6 +26,12 @@ max-line-length = 110
 # CLAUDE.md) — that's a design choice, not an oversight pylint should flag.
 # subprocess-run-check: every subprocess.run() here inspects returncode/stdout
 # itself rather than wanting an exception on nonzero exit.
+# too-many-instance-attributes: StageContext is one flat per-run permission
+# scope (local + remote), splitting it into sub-objects would just move the
+# same fields around, not reduce them.
+# too-many-return-statements: remote_exec has one early return per distinct
+# failure mode (unconfigured/denied/sanc unreachable/timeout) — each returns
+# a specific, actionable message instead of a generic exception.
 disable = [
     "missing-module-docstring",
     "missing-class-docstring",
@@ -33,4 +39,6 @@ disable = [
     "broad-exception-caught",
     "subprocess-run-check",
     "too-many-locals",
+    "too-many-instance-attributes",
+    "too-many-return-statements",
 ]

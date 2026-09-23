@@ -12,6 +12,7 @@ Not a fixed-rule restart tool, but an agent harness that can judge for itself "w
 - **Any OpenAI-compatible provider**: via [LiteLLM](https://github.com/BerriAI/litellm) or any OpenAI-compatible endpoint, different roles and tiers can each specify different models and providers.
 - **Extensible to any repo**: `artemis onboard <repo>` will actually scan the target project (README, CLAUDE.md, route configurations, etc.), have AI determine safe monitoring/remediation settings and generate config files, rather than requiring you to hand-code them.
 - **No Claude Code CLI needed**: both the judgment and execution layers are built on the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python), with self-built file read/write/bash execution tools and tiered permission whitelisting mechanisms.
+- **Optional remote execution**: stage1/stage3 can run commands against a configured remote host through [SessAnchor](https://github.com/)'s `sanc` CLI (`[remote]` in `artemis.toml`), so the executed command/output history is retrievable later via `sanc task`/`sanc output` without re-testing SSH connectivity — useful when a maintenance team hands work off between people or shifts.
 
 ## Architecture
 
@@ -79,6 +80,8 @@ docker compose up -d
 ## Security
 
 `agent_service` will execute bash commands and read/write files on the target repo based on requests; by default it only binds to `127.0.0.1`. If you need to expose it externally (e.g., `--host 0.0.0.0`), you must set `token_env` in `[agent_service]` and set the corresponding `ARTEMIS_AGENT_SERVICE_TOKEN` in the `agent_service` execution environment; otherwise anyone who can reach this port can make it execute arbitrary commands on this repo. Each tier (stage1~3) also has its own independent permission scope (bash whitelist / editable file list / prohibition of `git commit`·`git push`); see [CLAUDE.md](CLAUDE.md#agent_service-agent_service) for details.
+
+If `[remote]` is enabled, the same whitelist/git-commit-push rules also apply to `remote_exec` (see `remote.allowed_commands`). Note that the `sanc` build this integration targets does not yet support surviving an SSH disconnect (`sanc capabilities` reports `"ssh": false, "durable_tasks": false`) — `remote_exec` gives you a queryable execution history via `sanc task`/`sanc output`, not disconnect-resilient remote tasks.
 
 ## Testing
 

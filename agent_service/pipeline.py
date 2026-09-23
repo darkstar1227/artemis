@@ -189,7 +189,7 @@ def verify_resolved(req: EscalateRequest) -> bool:
 
 
 async def run_stage(stage: str, req: EscalateRequest, prompt: str, stage_ctx: StageContext) -> str:
-    agent = build_stage_agent(stage, req.escalation, req.orchestrator)
+    agent = build_stage_agent(stage, req.escalation, req.orchestrator, req.remote)
     # stage2/stage3 現在多了 list_dir/grep_files 可以先探索再動手,比純粹用 read_file
     # 猜路徑多花 1~2 輪,30 留一點餘裕但仍是硬上限,避免 agent 無止盡繞圈。
     timeout = max(req.orchestrator.timeout_secs, 180)
@@ -223,7 +223,15 @@ async def escalate(req: EscalateRequest) -> EscalationReport:
         "同時對這個事件做初步根因分析(若上面已經有多模型分析結果,直接沿用並視需要補充即可)。"
     )
     stage1_ctx = StageContext(
-        cwd=cwd, stage="stage1_immediate", bash_whitelist=req.escalation.stage1_allowed_tools
+        cwd=cwd,
+        stage="stage1_immediate",
+        bash_whitelist=req.escalation.stage1_allowed_tools,
+        remote_enabled=req.remote.enabled,
+        remote_device=req.remote.device_id,
+        sanc_bin=req.remote.sanc_bin,
+        remote_state_dir=req.remote.state_dir,
+        remote_timeout_secs=req.remote.timeout_secs,
+        remote_allowed_commands=req.remote.allowed_commands,
     )
     raw1 = await run_stage("stage1_immediate", req, stage1_prompt, stage1_ctx)
     stage1 = parse_stage("stage1_immediate", raw1)
@@ -272,7 +280,16 @@ async def escalate(req: EscalateRequest) -> EscalationReport:
         "但絕對不要執行任何 git commit 或 git push,修改完就停止,交由開發者審查。\n"
         f"{test_note}"
     )
-    stage3_ctx = StageContext(cwd=cwd, stage="stage3_code_fix", forbid_git_commit_push=True)
+    stage3_ctx = StageContext(
+        cwd=cwd,
+        stage="stage3_code_fix",
+        forbid_git_commit_push=True,
+        remote_enabled=req.remote.enabled,
+        remote_device=req.remote.device_id,
+        sanc_bin=req.remote.sanc_bin,
+        remote_state_dir=req.remote.state_dir,
+        remote_timeout_secs=req.remote.timeout_secs,
+    )
     raw3 = await run_stage("stage3_code_fix", req, stage3_prompt, stage3_ctx)
     stage3 = parse_stage("stage3_code_fix", raw3)
     resolved_after_3 = await asyncio.to_thread(verify_resolved, req)

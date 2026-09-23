@@ -40,6 +40,14 @@ pub fn escalate(incident: &Incident, cfg: &Config) -> Result<EscalationReport> {
             "log_analysis": cfg.agents.log_analysis,
             "root_cause_analysis": cfg.agents.root_cause_analysis,
         },
+        "remote": {
+            "enabled": cfg.remote.enabled,
+            "device_id": cfg.remote.device_id,
+            "sanc_bin": cfg.remote.sanc_bin,
+            "state_dir": cfg.remote.state_dir,
+            "timeout_secs": cfg.remote.timeout_secs,
+            "allowed_commands": cfg.remote.allowed_commands,
+        },
     });
 
     let mut req = ureq::post(&url)

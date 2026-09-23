@@ -33,6 +33,22 @@ class AgentsConfig(BaseModel):
     root_cause_analysis: AgentRoleConfig
 
 
+class RemoteConfig(BaseModel):
+    """Remote-execution backend via SessAnchor (`sanc`) — lets stage1/stage3
+    run commands against a configured remote host instead of only local `cwd`.
+    Kept separate from [escalation] since it's an optional add-on, not part
+    of the core staged-remediation contract."""
+
+    enabled: bool = False
+    device_id: Optional[str] = None
+    sanc_bin: str = "sanc"
+    state_dir: Optional[str] = None
+    timeout_secs: int = 120
+    # stage1 呼叫 remote_exec 時比照 stage1_allowed_tools 的白名單語法
+    # ("Bash(實際指令)"),空清單 = 這個階段不能用 remote_exec。
+    allowed_commands: list[str] = Field(default_factory=list)
+
+
 class EscalationSettings(BaseModel):
     """The subset of [escalation] that governs stage1~3 execution + verification."""
 
@@ -53,6 +69,7 @@ class EscalateRequest(BaseModel):
     escalation: EscalationSettings
     orchestrator: OrchestratorConfig
     agents: AgentsConfig
+    remote: RemoteConfig = Field(default_factory=RemoteConfig)
 
 
 class StageResult(BaseModel):

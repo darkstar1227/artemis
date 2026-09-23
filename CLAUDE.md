@@ -58,7 +58,7 @@ pytest tests/` do the same thing:
 cd agent_service
 uv sync --all-groups                                          # installs pytest/pylint dev deps too
 uv run python -c "import main"                              # import/syntax check
-uv run pytest tests/ -v                                      # runs all three smoke tests above
+uv run pytest tests/ -v                                      # runs all four smoke tests above
 uv run pylint main.py tools.py agents_def.py pipeline.py schemas.py central.py  # lint (10/10 gate)
 uv run uvicorn main:app --port 8787                          # then curl -X POST /escalate — see
                                                                # agent_client.rs for the request shape
@@ -147,9 +147,25 @@ guess an exact path for `read_file` — both are capped (`LIST_DIR_MAX_ENTRIES`,
 
 | Stage | Purpose | Tools given | In-tool guard |
 |---|---|---|---|
-| 1 — immediate disposition | safe mitigation (restart/cleanup) + draft root cause | `run_bash` only | `run_bash` rejects anything not exactly matching `escalation.stage1_allowed_tools` |
+| 1 — immediate disposition | safe mitigation (restart/cleanup) + draft root cause | `run_bash` (+ `remote_exec` if `[remote].enabled`) | `run_bash`/`remote_exec` reject anything not exactly matching `escalation.stage1_allowed_tools` / `remote.allowed_commands` |
 | 2 — parameter tuning | adjust app/server config | `read_file`, `edit_file`, `list_dir`, `grep_files` | `edit_file`/`write_file` reject any path not in `escalation.stage3_config_files` |
-| 3 — code-level temporary fix | edit source, run tests | `read_file`, `edit_file`, `write_file`, `run_bash`, `list_dir`, `grep_files` | `run_bash` rejects any command containing `git commit`/`git push` |
+| 3 — code-level temporary fix | edit source, run tests | `read_file`, `edit_file`, `write_file`, `run_bash`, `list_dir`, `grep_files` (+ `remote_exec` if `[remote].enabled`) | `run_bash`/`remote_exec` reject any command containing `git commit`/`git push` |
+
+**Remote execution (optional, `[remote]`)**: `tools.py::remote_exec` shells out to the
+[SessAnchor](https://github.com/) `sanc` CLI so stage1/stage3 can run commands against a configured
+remote device instead of only `cfg.cwd` on the machine running `agent_service`. Each call reuses one
+long-lived `sanc` session per device (`artemis-<device_id>`) and passes a fresh `--request-id` to
+`sanc exec`, so the actual command/output is retrievable later via `sanc task <id>`/`sanc output <id>`
+— that's the point: a maintainer taking over doesn't have to guess what already ran on that host or
+re-verify SSH connectivity from scratch, they can just look up the session's history through `sanc`
+directly. This is **not** disconnect-survival: the `sanc` build this was built against reports
+`"ssh": false, "durable_tasks": false` in `sanc capabilities`, and `sanc exec --help` itself says "No
+remote persistence on SSH loss yet" — if `agent_service` or the SSH connection drops mid-command, the
+remote command does not keep running and resume; only the request-id/session bookkeeping survives for
+later lookup. `sanc session create` is called best-effort before every `sanc exec` (a nonzero exit is
+assumed to mean "session already exists" and ignored, matching this codebase's degrade-gracefully
+philosophy elsewhere) — sanc itself doesn't expose an "already exists" check yet at the prototype
+stage this was integrated against.
 
 `run_stage()`'s `max_turns` is 30 (`pipeline.py`) to leave room for a `list_dir`/`grep_files`
 exploration pass before the stage's actual read/edit/bash calls, while still being a hard cap so an
@@ -201,7 +217,10 @@ tables with their own defaults, so a minimal config only needs `command`. `[agen
 `[escalation]`. `[escalation]` no longer has
 `claude_bin`/`model` (those were Claude Code CLI-specific); it instead has optional
 `execution_model`/`execution_base_url`/`execution_api_key_env` for stage1~3's model, falling back to
-`[orchestrator]`'s settings when unset.
+`[orchestrator]`'s settings when unset. `[remote]` (`enabled`, `device_id`, `sanc_bin`, `state_dir`,
+`timeout_secs`, `allowed_commands`) configures the optional SessAnchor remote-execution backend
+described above — disabled by default, and `remote_exec` isn't even added to a stage's tool list
+unless `enabled` and `device_id` are both set.
 
 ### Incident shape (src/incident.rs)
 
@@ -220,7 +239,7 @@ Python, `uv`-managed, built on the **OpenAI Agents SDK**. Files:
 - `schemas.py` — pydantic models for the `/escalate` request/response, mirroring the Rust structs
   above field-for-field so the JSON on both sides stays a straightforward 1:1 mapping.
 - `tools.py` — the self-built `read_file`/`edit_file`/`write_file`/`run_bash`/`list_dir`/
-  `grep_files` tool functions plus `StageContext` (the per-run permission scope) and the
+  `grep_files`/`remote_exec` tool functions plus `StageContext` (the per-run permission scope) and the
   path/whitelist/git-commit guards described above.
 - `agents_def.py` — builds `Agent`/`OpenAIChatCompletionsModel` instances from the request's config,
   one per judgment role and one per stage; `model_for()` is where per-role/per-stage
