@@ -3,6 +3,7 @@ mod ai;
 mod central_client;
 mod config;
 mod diagnostics;
+mod fingerprint;
 mod incident;
 mod matcher;
 mod onboard;

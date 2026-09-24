@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::incident::{Incident, Source};
+use crate::incident::{Incident, Severity, Source};
 use crate::store::Store;
 use anyhow::Result;
 use std::sync::Arc;
@@ -68,21 +68,18 @@ pub fn watch_resources(cfg: Arc<Config>, store: Arc<Store>) -> Result<()> {
 }
 
 fn emit(cfg: &Config, store: &Store, message: String) {
-    let incident = Incident {
-        id: Incident::new_id(),
-        timestamp: chrono::Utc::now(),
-        project: cfg.name.clone(),
-        source: Source::LogFile("system-resources".into()),
+    let incident = Incident::detected(
+        cfg.name.clone(),
+        Source::LogFile("system-resources".into()),
         message,
-        frames: vec![],
-        raw: String::new(),
-        command: cfg.command.clone(),
-        exit_code: None,
-        restarted: false,
-        restart_count: 0,
-        escalation: None,
-        diagnostics_history: Vec::new(),
-    };
+        vec![],
+        String::new(),
+        cfg.command.clone(),
+        None,
+        false,
+        0,
+        Severity::Medium,
+    );
     if let Err(e) = store.record(incident, cfg) {
         eprintln!("[artemis] 記錄資源事件失敗:{e}");
     }

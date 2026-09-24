@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::incident::{Incident, Source};
+use crate::incident::{Incident, Severity, Source};
 use crate::matcher::{LiveScanner, StreamMatcher};
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -20,21 +20,18 @@ fn drain_events(
     restart_count: u32,
 ) {
     while let Ok(event) = rx.try_recv() {
-        let incident = Incident {
-            id: Incident::new_id(),
-            timestamp: chrono::Utc::now(),
-            project: cfg.name.clone(),
-            source: Source::Process,
-            message: event.message,
-            frames: event.frames,
-            raw: event.raw,
-            command: cfg.command.clone(),
-            exit_code: None,
-            restarted: false,
+        let incident = Incident::detected(
+            cfg.name.clone(),
+            Source::Process,
+            event.message,
+            event.frames,
+            event.raw,
+            cfg.command.clone(),
+            None,
+            false,
             restart_count,
-            escalation: None,
-            diagnostics_history: Vec::new(),
-        };
+            Severity::High,
+        );
         if let Err(e) = store.record(incident, cfg) {
             eprintln!("[artemis] 記錄事件失敗:{e}");
         }
@@ -81,21 +78,18 @@ fn handle_exit(
         signal_suffix.unwrap_or_default()
     );
 
-    let incident = Incident {
-        id: Incident::new_id(),
-        timestamp: chrono::Utc::now(),
-        project: cfg.name.clone(),
-        source: Source::Process,
-        message: message.clone(),
-        frames: vec![],
-        raw: message,
-        command: cfg.command.clone(),
+    let incident = Incident::detected(
+        cfg.name.clone(),
+        Source::Process,
+        message.clone(),
+        vec![],
+        message,
+        cfg.command.clone(),
         exit_code,
-        restarted: cfg.auto_restart && restart_count < cfg.max_restarts,
+        cfg.auto_restart && restart_count < cfg.max_restarts,
         restart_count,
-        escalation: None,
-        diagnostics_history: Vec::new(),
-    };
+        Severity::Critical,
+    );
     let _ = store.record(incident, cfg);
 
     cfg.auto_restart && restart_count < cfg.max_restarts
@@ -150,21 +144,18 @@ pub fn watch(cfg: &Config, store: &Store) -> Result<()> {
         loop {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(event) => {
-                    let incident = Incident {
-                        id: Incident::new_id(),
-                        timestamp: chrono::Utc::now(),
-                        project: cfg.name.clone(),
-                        source: Source::Process,
-                        message: event.message,
-                        frames: event.frames,
-                        raw: event.raw,
-                        command: cfg.command.clone(),
-                        exit_code: None,
-                        restarted: false,
+                    let incident = Incident::detected(
+                        cfg.name.clone(),
+                        Source::Process,
+                        event.message,
+                        event.frames,
+                        event.raw,
+                        cfg.command.clone(),
+                        None,
+                        false,
                         restart_count,
-                        escalation: None,
-                        diagnostics_history: Vec::new(),
-                    };
+                        Severity::High,
+                    );
                     if let Err(e) = store.record(incident, cfg) {
                         eprintln!("[artemis] 記錄事件失敗:{e}");
                     }

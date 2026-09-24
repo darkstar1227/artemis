@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::incident::{Incident, Source};
+use crate::incident::{Incident, Severity, Source};
 use crate::matcher::{LiveScanner, StreamMatcher};
 use crate::store::Store;
 use anyhow::Result;
@@ -76,21 +76,18 @@ fn record_log_incident(
     path: &str,
     event: crate::matcher::ErrorEvent,
 ) {
-    let incident = Incident {
-        id: Incident::new_id(),
-        timestamp: chrono::Utc::now(),
-        project: cfg.name.clone(),
-        source: Source::LogFile(path.to_string()),
-        message: event.message,
-        frames: event.frames,
-        raw: event.raw,
-        command: cfg.command.clone(),
-        exit_code: None,
-        restarted: false,
-        restart_count: 0,
-        escalation: None,
-        diagnostics_history: Vec::new(),
-    };
+    let incident = Incident::detected(
+        cfg.name.clone(),
+        Source::LogFile(path.to_string()),
+        event.message,
+        event.frames,
+        event.raw,
+        cfg.command.clone(),
+        None,
+        false,
+        0,
+        Severity::High,
+    );
     if let Err(e) = store.record(incident, cfg) {
         eprintln!("[artemis] 記錄事件失敗:{e}");
     }
