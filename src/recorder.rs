@@ -80,7 +80,8 @@
 use crate::agent_client;
 use crate::central_client;
 use crate::config::{Config, IncidentsConfig};
-use crate::dedup::{Decision, Deduper};
+use crate::dedup::{Decision, Deduper, Entry};
+use crate::fingerprint;
 use crate::incident::{EscalationReport, Incident, IncidentStatus};
 use crate::store::Store;
 use anyhow::Result;
@@ -239,17 +240,25 @@ impl Recorder {
             sink,
             escalator,
             clock,
+            cfg.incidents_dir.clone(),
+            cfg.name.clone(),
         ))
     }
 
     /// 測試/依賴注入用建構子:換掉 Sink/Escalator/Clock,行為(去重、節流、
-    /// pending 上限)完全比照 production。
+    /// pending 上限)完全比照 production。`incidents_dir`/`project` 是
+    /// Milestone 1 step 5 啟動重建掃描用的——測試通常指向一個乾淨/不存在的
+    /// 目錄,重建就是無事可做的 no-op(見 `rebuild_state` 對讀不到目錄的
+    /// 處理)。
+    #[allow(clippy::too_many_arguments)]
     pub fn with_deps(
         incidents_cfg: IncidentsConfig,
         escalation_enabled: bool,
         sink: Arc<dyn Sink>,
         escalator: Arc<dyn Escalator>,
         clock: Clock,
+        incidents_dir: String,
+        project: String,
     ) -> (Recorder, thread::JoinHandle<()>) {
         let (detected_tx, detected_rx) =
             mpsc::sync_channel::<Incident>(incidents_cfg.max_queue.max(1));
@@ -271,6 +280,8 @@ impl Recorder {
                 escalation_enabled,
                 sink,
                 clock,
+                incidents_dir,
+                project,
             );
         });
 
@@ -573,6 +584,10 @@ fn handle_escalation_done(
     sink.push_central(inc);
 }
 
+/// 每次 Tick 最多執行「標記 Resolved」(含跑一次分析器)的筆數上限,見
+/// `handle_tick` 內對應那段的說明。
+const MAX_RESOLVES_PER_TICK: usize = 16;
+
 fn handle_tick(
     state: &mut IntakeState,
     sink: &dyn Sink,
@@ -616,11 +631,247 @@ fn handle_tick(
         state.last_flush.insert(id, now);
     }
 
-    // TODO(step 5): 這裡之後要加上 `state.deduper.resolve_due(now)` 掃描
-    // 長期沒再出現的 Open/Mitigated incident、標成 Resolved 並回呼
-    // `set_status` + 落地;以及 `Recorder::new` 啟動時從 `incidents_dir`
-    // 重建 `active`/deduper 狀態(目前重啟後這兩者都是空的,舊事件的去重
-    // 狀態不會被還原)。兩者都還沒做。
+    // Resolve tick(Milestone 1 step 5):`Deduper::resolve_due` 掃描出所有
+    // 閒置超過 `resolve_after_secs` 的 Open/Mitigated/Suppressed 指紋(見
+    // `resolve_due` 文件對 Suppressed 也一併處理的說明)。這裡同時也是
+    // `active`(以及 `dirty`/`last_flush`)的唯一清除點——一個 incident 一旦
+    // 被標記 Resolved 就不會再被 Append,留在 `active` 裡沒有意義,清掉才能
+    // 讓這個 map 隨時間有界。
+    //
+    // 每個 Tick 最多處理 `MAX_RESOLVES_PER_TICK` 筆——`render_markdown`
+    // 每筆都會 fork 一個 `uv` 子行程跑分析器,重啟後如果一次到期一大批
+    // (例如長時間停機、幾百個指紋同時逾期),不設上限會讓這次 Tick(進而
+    // 整個 intake 執行緒,因為它是單執行緒依序處理)被卡住一段不小的時間,
+    // 期間新進來的 Detected 事件全部要等。沒處理到的那些不會遺失——
+    // `resolve_due` 每次都重新計算,狀態沒被改掉的 entry 下一次 Tick
+    // 一樣會被選中,而且因為 `resolve_due` 保證回傳順序是 `last_seen`
+    // 由舊到新(見它的文件),優先被處理的一定是逾期最久的那些,不會有
+    // entry 因為 HashMap 迭代順序不固定而被無限期跳過。
+    let resolved_ids = state.deduper.resolve_due(now);
+    for id in resolved_ids.into_iter().take(MAX_RESOLVES_PER_TICK) {
+        let fp = state
+            .active
+            .get(&id)
+            .and_then(|inc| inc.fingerprint.clone());
+        if let Some(inc) = state.active.get_mut(&id) {
+            inc.status = IncidentStatus::Resolved;
+            inc.status_reason = Some("no_recurrence".to_string());
+            write_json(sink, inc);
+            sink.render_markdown(inc);
+            sink.push_central(inc);
+        }
+        if let Some(fp) = fp {
+            state.deduper.set_status(&fp, IncidentStatus::Resolved);
+        }
+        state.active.remove(&id);
+        state.dirty.remove(&id);
+        state.last_flush.remove(&id);
+    }
+
+    // 把久到不再影響任何未來決策的 Resolved entry 從 Deduper 修剪掉,見
+    // `Deduper::prune_expired` 的文件。
+    state.deduper.prune_expired(now);
+}
+
+/// Milestone 1 step 5:行程啟動、intake 開始處理任何 Detected 事件之前,
+/// 掃描 `incidents_dir` 底下既有的事件 JSON,重建 `Deduper` 的去重/冷卻/
+/// storm guard 狀態與 intake 的 `active` map——否則每次重啟,舊事件的
+/// 去重狀態就全部歸零,cooldown/dedup window 形同虛設。
+///
+/// 詳細規則見下方各步驟註解;整體策略是「只用得到、算得便宜的資訊才讀」:
+/// **檔案 mtime**(不是檔名前綴!)比
+/// `horizon = max(dedup_window_secs, cooldown_secs, resolve_after_secs)`
+/// 還舊的檔案直接跳過、連 JSON 都不解析——理由見 `Deduper::prune_expired`
+/// 的文件:比這個 horizon 還舊的事件,不管內容是什麼,都不會再改變任何
+/// 未來的去重決策。
+///
+/// **為什麼是 mtime,不是檔名前綴的建立時間**:`write_json` 在每次累加次數
+/// 的節流重寫、以及最終狀態更新時都會整份重寫檔案,所以 mtime 會跟著
+/// `last_seen` 一起前進;檔名前綴(`Incident::new_id` 的
+/// `%Y%m%dT%H%M%S`)則是這個 incident 第一次被建立的時間,終其一生不會變。
+/// 用檔名前綴當「這個檔案是不是太舊」的判斷,會把「2 小時前建立、但 1
+/// 分鐘前才又出現過(last_seen 很新)、horizon 只有 1 小時」的 incident
+/// 誤判成太舊而跳過——結果是重建漏掉它,重啟後同一個指紋被當成全新事件,
+/// 產生重複的 incident 並且重新升級處置一次(這正是 verifier 抓到的
+/// bug)。mtime 讀不到(理論上不會發生,例如檔案系統不支援 mtime)則保守地
+/// 照樣解析整份 JSON,用真正的 `last_seen`(退回 `timestamp`)欄位篩一次
+/// ——見下方 `age_basis` 那行,post-parse 的篩選同樣改用 `last_seen`,不是
+/// `timestamp`,原因相同。
+fn rebuild_state(
+    incidents_dir: &str,
+    project: &str,
+    cfg: &IncidentsConfig,
+    sink: &dyn Sink,
+    now: DateTime<Utc>,
+) -> IntakeState {
+    let mut deduper = Deduper::new(cfg.clone());
+    let mut active = HashMap::new();
+    let mut fp_active = HashMap::new();
+
+    let empty_state = |deduper| IntakeState {
+        deduper,
+        active: HashMap::new(),
+        fp_active: HashMap::new(),
+        dirty: HashSet::new(),
+        last_flush: HashMap::new(),
+        pending: HashSet::new(),
+    };
+
+    let dir_entries = match fs::read_dir(incidents_dir) {
+        Ok(e) => e,
+        // 目錄還不存在(第一次執行)或讀不到:視為沒有任何舊事件,不算錯誤。
+        Err(_) => return empty_state(deduper),
+    };
+
+    let horizon = ChronoDuration::seconds(
+        cfg.dedup_window_secs
+            .max(cfg.cooldown_secs)
+            .max(cfg.resolve_after_secs) as i64,
+    );
+
+    // fingerprint → 這個指紋底下所有(通過篩選的)incident,附帶「落地時
+    // 狀態是不是 Escalating(重建前)」這個旗標,供之後判斷 last_escalated
+    // 與是否需要把它改標成 interrupted 用。
+    let mut by_fp: HashMap<String, Vec<(Incident, bool)>> = HashMap::new();
+
+    for entry in dir_entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // 見上方文件:用檔案 mtime(不是檔名前綴)判斷是否太舊、值不值得
+        // 解析。mtime 讀不到就不 skip,照樣往下讀整份 JSON,用真正的
+        // `last_seen` 再篩一次。
+        if let Ok(meta) = fs::metadata(&path) {
+            if let Ok(modified) = meta.modified() {
+                let mtime: DateTime<Utc> = modified.into();
+                if now - mtime > horizon {
+                    continue;
+                }
+            }
+        }
+
+        let raw = match fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[artemis] 重建事件狀態:無法讀取 {}:{e}", path.display());
+                continue;
+            }
+        };
+        let mut inc: Incident = match serde_json::from_str(&raw) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("[artemis] 重建事件狀態:無法解析 {}:{e}", path.display());
+                continue;
+            }
+        };
+
+        if inc.project != project {
+            continue;
+        }
+        // 跟前面的 mtime 篩選用同一個原則:一個 incident 是否還「活著」看
+        // 的是它最近一次出現的時間(`last_seen`),不是它第一次被建立的
+        // 時間(`timestamp`)——沒有 `last_seen`(理論上不會發生,`Incident
+        // ::detected` 一律會填)才退回 `timestamp`。
+        let age_basis = inc.last_seen.unwrap_or(inc.timestamp);
+        if now - age_basis > horizon {
+            continue;
+        }
+
+        if inc.fingerprint.is_none() {
+            let (fp, template) = fingerprint::compute(&inc.source, &inc.message, &inc.frames);
+            inc.fingerprint = Some(fp);
+            inc.fingerprint_template = Some(template);
+        }
+
+        let was_escalating = inc.status == IncidentStatus::Escalating;
+        if was_escalating {
+            inc.status = IncidentStatus::Open;
+            inc.status_reason = Some("interrupted".to_string());
+        }
+
+        let fp = inc.fingerprint.clone().unwrap_or_default();
+        by_fp.entry(fp).or_default().push((inc, was_escalating));
+    }
+
+    let mut storm_seed = Vec::new();
+
+    for (fp, mut group) in by_fp {
+        // 中斷在升級處置途中的事件:重建時就地改標成 Open("interrupted")
+        // 並落地(JSON + Markdown),但不重新送一次升級處置——見模組文件
+        // 「Shutdown」一節,這些 incident 在關機前就已經以 Escalating 狀態
+        // 落地過,不是遺失,只是中斷。
+        for (inc, was_escalating) in &mut group {
+            if *was_escalating {
+                write_json(sink, inc);
+                sink.render_markdown(inc);
+            }
+        }
+
+        // 同一指紋只留「最新一筆」(依 last_seen,沒有的話退回 timestamp)
+        // 當 Deduper 的代表 entry。
+        let rep_idx = group
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (inc, _))| inc.last_seen.unwrap_or(inc.timestamp))
+            .map(|(i, _)| i)
+            .expect("by_fp 的每個 group 都至少有一筆,不會是空的");
+        let representative = group[rep_idx].0.clone();
+
+        // last_escalated 的估算規則:這個指紋底下,凡是「曾經是 Escalating
+        // (不論後來有沒有被中斷改標)、目前是 Mitigated、或帶有非空
+        // `escalation` 欄位」的事件,都代表「這個時間點真的呼叫過一次
+        // agent_service」,取這些事件裡最新的 last_seen/timestamp 當
+        // last_escalated——這是 cooldown 判斷唯一關心的事;純粹只是累加次數
+        // 的 Open/Suppressed 事件不計入。
+        let last_escalated = group
+            .iter()
+            .filter(|(inc, was_escalating)| {
+                *was_escalating
+                    || inc.status == IncidentStatus::Mitigated
+                    || inc.escalation.is_some()
+            })
+            .map(|(inc, _)| inc.last_seen.unwrap_or(inc.timestamp))
+            .max();
+
+        if let Some(t) = last_escalated {
+            if now - t <= ChronoDuration::hours(1) {
+                storm_seed.push(t);
+            }
+        }
+
+        deduper.restore(
+            fp.clone(),
+            Entry {
+                id: representative.id.clone(),
+                status: representative.status,
+                first_seen: representative.first_seen.unwrap_or(representative.timestamp),
+                last_seen: representative.last_seen.unwrap_or(representative.timestamp),
+                last_escalated,
+            },
+        );
+
+        // 只有非 Resolved 的代表事件需要放進 `active`,讓之後的 `Append`
+        // 找得到它更新次數;Resolved 的只留在 Deduper entries 裡供
+        // recurrence 判斷用。
+        if representative.status != IncidentStatus::Resolved {
+            fp_active.insert(fp, representative.id.clone());
+            active.insert(representative.id.clone(), representative);
+        }
+    }
+
+    if !storm_seed.is_empty() {
+        deduper.seed_storm(storm_seed, now);
+    }
+
+    IntakeState {
+        deduper,
+        active,
+        fp_active,
+        dirty: HashSet::new(),
+        last_flush: HashMap::new(),
+        pending: HashSet::new(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -633,15 +884,12 @@ fn run_intake(
     escalation_enabled: bool,
     sink: Arc<dyn Sink>,
     clock: Clock,
+    incidents_dir: String,
+    project: String,
 ) {
-    let mut state = IntakeState {
-        deduper: Deduper::new(incidents_cfg.clone()),
-        active: HashMap::new(),
-        fp_active: HashMap::new(),
-        dirty: HashSet::new(),
-        last_flush: HashMap::new(),
-        pending: HashSet::new(),
-    };
+    // Milestone 1 step 5:在處理第一筆 Detected 事件之前,先把
+    // `incidents_dir` 底下既有的事件狀態重建回來(見 `rebuild_state` 文件)。
+    let mut state = rebuild_state(&incidents_dir, &project, &incidents_cfg, sink.as_ref(), clock());
     let rewrite_interval = ChronoDuration::seconds(incidents_cfg.rewrite_interval_secs as i64);
     // Tick 的排程刻意用真實的 `Instant`(wall clock),跟 `clock` 注入的
     // 「業務時間」脫鉤:`clock` 是給去重/storm guard/節流重寫這些「事件發生
@@ -822,7 +1070,6 @@ mod tests {
             }
         }
 
-        #[allow(dead_code)] // 目前的測試都用固定時間;之後測 cooldown/storm 恢復時會用到。
         fn advance(&self, delta_ms: i64) {
             self.ms.fetch_add(delta_ms, Ordering::SeqCst);
         }
@@ -977,6 +1224,16 @@ mod tests {
         )
     }
 
+    /// 大部分測試不測啟動重建,不需要真的有事件目錄 —— 給一個保證不存在的
+    /// 路徑,`rebuild_state` 讀不到目錄時視為「沒有舊事件」直接回傳空狀態
+    /// (見 `rebuild_state` 對 `fs::read_dir` 失敗的處理),行為等同重建前。
+    fn test_incidents_dir() -> String {
+        format!(
+            "/tmp/artemis-recorder-test-{}-does-not-exist",
+            uuid::Uuid::new_v4()
+        )
+    }
+
     /// 輪詢直到條件成立或逾時 —— intake 是背景執行緒,斷言前需要等它處理完。
     fn wait_until<F: Fn() -> bool>(cond: F, timeout: StdDuration) {
         let deadline = Instant::now() + timeout;
@@ -997,6 +1254,8 @@ mod tests {
             sink.clone(),
             escalator.clone(),
             clock.as_clock(),
+            test_incidents_dir(),
+            "demo".to_string(),
         );
 
         let mut first_id = None;
@@ -1036,7 +1295,7 @@ mod tests {
         let escalator = BlockingEscalator::new(barrier.clone());
         let clock = FakeClock::new(1_700_000_000_000);
         let (recorder, _handle) =
-            Recorder::with_deps(incidents_cfg(1024, 100), true, sink, escalator, clock.as_clock());
+            Recorder::with_deps(incidents_cfg(1024, 100), true, sink, escalator, clock.as_clock(), test_incidents_dir(), "demo".to_string());
 
         let start = Instant::now();
         for i in 0..100 {
@@ -1097,6 +1356,8 @@ mod tests {
             blocking_sink,
             escalator,
             clock.as_clock(),
+            test_incidents_dir(),
+            "demo".to_string(),
         );
 
         let fp_message = "overflow test error";
@@ -1135,6 +1396,8 @@ mod tests {
             sink.clone(),
             escalator,
             clock.as_clock(),
+            test_incidents_dir(),
+            "demo".to_string(),
         );
 
         let first = make_incident("fingerprint one boom");
@@ -1171,6 +1434,8 @@ mod tests {
             sink.clone(),
             escalator,
             clock.as_clock(),
+            test_incidents_dir(),
+            "demo".to_string(),
         );
 
         let inc = make_incident("resolved-by-escalation");
@@ -1198,6 +1463,8 @@ mod tests {
             sink.clone(),
             escalator,
             clock.as_clock(),
+            test_incidents_dir(),
+            "demo".to_string(),
         );
 
         let inc = make_incident("escalation-call-fails");
@@ -1228,6 +1495,8 @@ mod tests {
             sink,
             escalator,
             clock.as_clock(),
+            test_incidents_dir(),
+            "demo".to_string(),
         );
 
         drop(recorder);
@@ -1253,7 +1522,7 @@ mod tests {
         let escalator = ImmediateEscalator::ok(false);
         let clock = FakeClock::new(1_700_000_000_000);
         let (recorder, handle) =
-            Recorder::with_deps(cfg, true, sink.clone(), escalator, clock.as_clock());
+            Recorder::with_deps(cfg, true, sink.clone(), escalator, clock.as_clock(), test_incidents_dir(), "demo".to_string());
 
         // 這份 clone 模擬 watcher/resource 監看執行緒手上還留著的 Recorder
         // ——這正是這次修的 bug 的關鍵情境:即使還有其他 clone 活著、
@@ -1298,7 +1567,7 @@ mod tests {
         let escalator = BlockingEscalator::new(barrier);
         let clock = FakeClock::new(1_700_000_000_000);
         let (recorder, handle) =
-            Recorder::with_deps(cfg, true, sink.clone(), escalator, clock.as_clock());
+            Recorder::with_deps(cfg, true, sink.clone(), escalator, clock.as_clock(), test_incidents_dir(), "demo".to_string());
 
         let inc = make_incident("stuck escalation on shutdown");
         recorder.submit(inc);
@@ -1321,5 +1590,544 @@ mod tests {
             elapsed < grace + margin,
             "grace period 到期後 shutdown 應該盡快回傳,不能無限期卡住,實際耗時:{elapsed:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Milestone 1 step 5:啟動重建(rebuild_state)+ Resolve tick 測試。
+    // ------------------------------------------------------------------
+
+    /// 測試用的真實暫存目錄,`Drop` 時自動清掉,避免這些測試在磁碟上留下垃圾。
+    struct TempIncidentsDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempIncidentsDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("artemis-rebuild-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).expect("建立測試用暫存目錄失敗");
+            Self { path }
+        }
+
+        fn path_str(&self) -> String {
+            self.path.to_string_lossy().to_string()
+        }
+
+        /// 直接把一筆手工建構的 incident 寫成 JSON 檔,檔名依它的 `id` 命名
+        /// ——`rebuild_state` 靠檔名前綴判斷年紀,呼叫端必須確保 `inc.id` 的
+        /// 時間戳前綴跟 `inc.timestamp` 一致。
+        /// 寫入 JSON,並把檔案 mtime 硬設成 `inc.last_seen`(退回
+        /// `timestamp`)——`rebuild_state` 現在是用 mtime(不是檔名前綴)
+        /// 判斷檔案年紀,單靠 `fs::write` 產生的「真正現在」mtime 沒辦法
+        /// 模擬出「很久以前建立、但最近才又出現過」這種情境,測試必須自己
+        /// 把 mtime 校正回這個 incident 應該有的年紀。
+        fn write(&self, inc: &Incident) {
+            let path = self.path.join(format!("{}.json", inc.id));
+            fs::write(&path, serde_json::to_string_pretty(inc).unwrap()).expect("寫入測試 incident JSON 失敗");
+            let mtime_basis = inc.last_seen.unwrap_or(inc.timestamp);
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("重新開啟測試 incident JSON 失敗");
+            file.set_modified(mtime_basis.into())
+                .expect("設定測試 incident JSON mtime 失敗");
+        }
+    }
+
+    impl Drop for TempIncidentsDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// 手工建構一筆可控制時間戳/狀態/指紋的 incident,供重建測試直接寫進
+    /// 暫存目錄。`id` 的時間戳前綴會依 `ts` 產生,確保檔名年紀判斷跟
+    /// `timestamp`/`last_seen` 一致。
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild_test_incident(
+        ts: DateTime<Utc>,
+        last_seen: DateTime<Utc>,
+        message: &str,
+        fingerprint: Option<String>,
+        status: IncidentStatus,
+        escalation: Option<EscalationReport>,
+    ) -> Incident {
+        let id = format!(
+            "{}-{}",
+            ts.format("%Y%m%dT%H%M%S"),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+        let fingerprint_template = fingerprint
+            .as_ref()
+            .map(|_| fingerprint::normalize_template(message));
+        Incident {
+            id,
+            timestamp: ts,
+            project: "demo".to_string(),
+            source: Source::Process,
+            message: message.to_string(),
+            frames: vec![],
+            raw: message.to_string(),
+            command: "node app.js".to_string(),
+            exit_code: Some(1),
+            restarted: false,
+            restart_count: 0,
+            escalation,
+            diagnostics_history: vec![],
+            fingerprint,
+            fingerprint_template,
+            occurrence_count: 1,
+            first_seen: Some(ts),
+            last_seen: Some(last_seen),
+            status,
+            status_reason: None,
+            recurrence_of: None,
+            severity: Severity::High,
+        }
+    }
+
+    #[test]
+    fn rebuild_recomputes_missing_fingerprint_and_appends_new_submission() {
+        let dir = TempIncidentsDir::new();
+        let clock = FakeClock::new(1_700_000_000_000);
+        let now = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
+
+        // 舊格式 JSON:沒有 fingerprint 欄位(None),status Open,最近才發生
+        // 過(在 dedup window 內)。
+        let old = rebuild_test_incident(
+            now - ChronoDuration::seconds(10),
+            now - ChronoDuration::seconds(10),
+            "boom: connection refused",
+            None,
+            IncidentStatus::Open,
+            None,
+        );
+        let old_id = old.id.clone();
+        dir.write(&old);
+
+        let sink = FakeSink::new();
+        let escalator = ImmediateEscalator::ok(false);
+        let (recorder, _handle) = Recorder::with_deps(
+            incidents_cfg(1024, 8),
+            true,
+            sink.clone(),
+            escalator.clone(),
+            clock.as_clock(),
+            dir.path_str(),
+            "demo".to_string(),
+        );
+
+        // 同一則訊息再次出現,應該 Append 到重建回來的既有 incident 上,
+        // 而不是建立一筆新的、也不應該重新升級處置。
+        recorder.submit(make_incident("boom: connection refused"));
+
+        wait_until(
+            || {
+                sink.last_write(&old_id)
+                    .map(|i| i.occurrence_count == 2)
+                    .unwrap_or(false)
+            },
+            StdDuration::from_secs(3),
+        );
+        assert_eq!(
+            escalator.call_count(),
+            0,
+            "Append 到既有 incident 不應該觸發升級處置"
+        );
+    }
+
+    #[test]
+    fn rebuild_marks_interrupted_escalating_as_open_without_reescalating() {
+        let dir = TempIncidentsDir::new();
+        let clock = FakeClock::new(1_700_000_000_000);
+        let now = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
+
+        let stuck = rebuild_test_incident(
+            now - ChronoDuration::seconds(5),
+            now - ChronoDuration::seconds(5),
+            "interrupted mid-escalation",
+            Some("deadbeefdeadbeef".to_string()),
+            IncidentStatus::Escalating,
+            None,
+        );
+        let stuck_id = stuck.id.clone();
+        dir.write(&stuck);
+
+        let sink = FakeSink::new();
+        let escalator = ImmediateEscalator::ok(false);
+        let (_recorder, _handle) = Recorder::with_deps(
+            incidents_cfg(1024, 8),
+            true,
+            sink.clone(),
+            escalator.clone(),
+            clock.as_clock(),
+            dir.path_str(),
+            "demo".to_string(),
+        );
+
+        wait_until(
+            || {
+                sink.last_write(&stuck_id)
+                    .map(|i| {
+                        i.status == IncidentStatus::Open
+                            && i.status_reason.as_deref() == Some("interrupted")
+                    })
+                    .unwrap_or(false)
+            },
+            StdDuration::from_secs(3),
+        );
+        assert_eq!(
+            escalator.call_count(),
+            0,
+            "重建中斷的 Escalating 事件不應該重新送出升級處置"
+        );
+    }
+
+    #[test]
+    fn rebuild_recurrence_right_after_restart_is_suppressed_by_cooldown() {
+        let dir = TempIncidentsDir::new();
+        let clock = FakeClock::new(1_700_000_000_000);
+        let now = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
+
+        // 400 秒前已經 Mitigated 過一次(帶 escalation 結果)——距離現在超過
+        // dedup_window(300s,見 incidents_cfg),但還沒超過 cooldown(1800s)。
+        let mitigated = rebuild_test_incident(
+            now - ChronoDuration::seconds(400),
+            now - ChronoDuration::seconds(400),
+            "mitigated then recurs",
+            Some("cafebabecafebabe".to_string()),
+            IncidentStatus::Mitigated,
+            Some(EscalationReport {
+                final_resolved: true,
+                ..Default::default()
+            }),
+        );
+        dir.write(&mitigated);
+
+        let sink = FakeSink::new();
+        let escalator = ImmediateEscalator::ok(false);
+        let (recorder, _handle) = Recorder::with_deps(
+            incidents_cfg(1024, 8),
+            true,
+            sink.clone(),
+            escalator.clone(),
+            clock.as_clock(),
+            dir.path_str(),
+            "demo".to_string(),
+        );
+
+        let mut recurrence = make_incident("mitigated then recurs");
+        recurrence.fingerprint = Some("cafebabecafebabe".to_string());
+        let recurrence_id = recurrence.id.clone();
+        recorder.submit(recurrence);
+
+        wait_until(
+            || {
+                sink.last_write(&recurrence_id)
+                    .map(|i| i.status_reason.as_deref() == Some("cooldown"))
+                    .unwrap_or(false)
+            },
+            StdDuration::from_secs(3),
+        );
+        let final_inc = sink.last_write(&recurrence_id).unwrap();
+        assert_eq!(final_inc.status, IncidentStatus::Suppressed);
+        assert_eq!(
+            escalator.call_count(),
+            0,
+            "cooldown 內的 recurrence 不應該重新升級處置"
+        );
+    }
+
+    #[test]
+    fn rebuild_skips_files_older_than_horizon() {
+        let dir = TempIncidentsDir::new();
+        let clock = FakeClock::new(1_700_000_000_000);
+        let now = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
+
+        // horizon = max(dedup_window=300, cooldown=1800, resolve_after=3600)
+        // = 3600s;這筆事件比 horizon 還舊很多,重建時應該直接跳過(不讀取
+        // 內容、不佔用 fp_active)。
+        let ancient = rebuild_test_incident(
+            now - ChronoDuration::seconds(10_000),
+            now - ChronoDuration::seconds(10_000),
+            "ancient error, long resolved",
+            Some("0123456789abcdef".to_string()),
+            IncidentStatus::Mitigated,
+            Some(EscalationReport {
+                final_resolved: true,
+                ..Default::default()
+            }),
+        );
+        dir.write(&ancient);
+
+        let sink = FakeSink::new();
+        let escalator = ImmediateEscalator::ok(false);
+        let (recorder, _handle) = Recorder::with_deps(
+            incidents_cfg(1024, 8),
+            true,
+            sink.clone(),
+            escalator.clone(),
+            clock.as_clock(),
+            dir.path_str(),
+            "demo".to_string(),
+        );
+
+        let mut fresh = make_incident("ancient error, long resolved");
+        fresh.fingerprint = Some("0123456789abcdef".to_string());
+        let fresh_id = fresh.id.clone();
+        recorder.submit(fresh);
+
+        // 舊指紋被跳過,不影響去重狀態 → 這次出現被當成全新事件,直接升級
+        // (escalator 回傳 final_resolved=false,所以最終狀態是 Open,重點是
+        // 確實跑過一次 escalation,而不是被 Append 到那筆被跳過的舊事件)。
+        wait_until(
+            || {
+                sink.last_write(&fresh_id)
+                    .map(|i| i.escalation.is_some())
+                    .unwrap_or(false)
+            },
+            StdDuration::from_secs(3),
+        );
+        assert_eq!(
+            escalator.call_count(),
+            1,
+            "太舊被跳過的事件不該影響去重,這次應該被當成全新事件升級處置"
+        );
+    }
+
+    /// 修 verifier 抓到的 HIGH bug:一個很久以前建立、但最近才又出現過的
+    /// incident,不應該因為「建立時間」比 horizon 還舊就被重建跳過——
+    /// 用來判斷年紀的必須是它「還活著」的證據(mtime ≈ last_seen),不是
+    /// 出生證明(檔名前綴/timestamp)。
+    #[test]
+    fn rebuild_uses_last_seen_not_creation_time_for_horizon_check() {
+        let dir = TempIncidentsDir::new();
+        let clock = FakeClock::new(1_700_000_000_000);
+        let now = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
+
+        // horizon = max(300, 1800, 3600) = 3600s(1 小時)。這筆事件建立於
+        // 2 小時前(超過 horizon),但 1 分鐘前才又出現過一次(last_seen 很
+        // 新)——不應該被當成太舊跳過。
+        let alive = rebuild_test_incident(
+            now - ChronoDuration::hours(2),
+            now - ChronoDuration::minutes(1),
+            "long-lived recurring error",
+            Some("abad1deaabad1dea".to_string()),
+            IncidentStatus::Open,
+            None,
+        );
+        let alive_id = alive.id.clone();
+        dir.write(&alive);
+
+        let sink = FakeSink::new();
+        let escalator = ImmediateEscalator::ok(false);
+        let (recorder, _handle) = Recorder::with_deps(
+            incidents_cfg(1024, 8),
+            true,
+            sink.clone(),
+            escalator.clone(),
+            clock.as_clock(),
+            dir.path_str(),
+            "demo".to_string(),
+        );
+
+        let mut recurrence = make_incident("long-lived recurring error");
+        recurrence.fingerprint = Some("abad1deaabad1dea".to_string());
+        recorder.submit(recurrence);
+
+        // 應該被 Append 到重建回來的既有 incident 上(occurrence_count 從 1
+        // 變成 2),而不是被跳過、建立成一筆新的 incident。
+        wait_until(
+            || {
+                sink.last_write(&alive_id)
+                    .map(|i| i.occurrence_count == 2)
+                    .unwrap_or(false)
+            },
+            StdDuration::from_secs(3),
+        );
+        assert_eq!(
+            escalator.call_count(),
+            0,
+            "Append 到既有(未過期)incident 不應該重新升級處置"
+        );
+        // 也確認真的沒有另外建立一筆新 incident(fingerprint 相同的兩筆
+        // 檔案)。
+        let distinct_ids: HashSet<String> = sink
+            .calls
+            .lock()
+            .unwrap()
+            .write_json
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        assert_eq!(
+            distinct_ids,
+            [alive_id].into_iter().collect::<HashSet<_>>(),
+            "不應該因為誤判太舊而建立出第二筆重複的 incident"
+        );
+    }
+
+    #[test]
+    fn resolve_tick_marks_idle_incident_resolved_then_recurrence_creates_new_incident() {
+        let mut cfg = incidents_cfg(1024, 8);
+        cfg.resolve_after_secs = 5;
+        cfg.dedup_window_secs = 1;
+        cfg.rewrite_interval_secs = 3600; // 不靠自然節流重寫,只看 tick 邏輯本身。
+        let sink = FakeSink::new();
+        let escalator = ImmediateEscalator::ok(false);
+        let clock = FakeClock::new(1_700_000_000_000);
+        let (recorder, _handle) = Recorder::with_deps(
+            cfg,
+            true,
+            sink.clone(),
+            escalator.clone(),
+            clock.as_clock(),
+            test_incidents_dir(),
+            "demo".to_string(),
+        );
+
+        let inc = make_incident("idles then resolves");
+        let id = inc.id.clone();
+        recorder.submit(inc);
+        wait_until(|| sink.last_write(&id).is_some(), StdDuration::from_secs(3));
+
+        // 把時鐘撥到超過 resolve_after_secs(5s)之後,intake 的 Tick(真實
+        // 1 秒一次)之後應該會把它標記 Resolved 並落地。
+        clock.advance(6_000);
+        wait_until(
+            || {
+                sink.last_write(&id)
+                    .map(|i| {
+                        i.status == IncidentStatus::Resolved
+                            && i.status_reason.as_deref() == Some("no_recurrence")
+                    })
+                    .unwrap_or(false)
+            },
+            StdDuration::from_secs(3),
+        );
+
+        // 之後同一個 fingerprint 再出現一次:因為代表 entry 已經是
+        // Resolved,應該被判定為 recurrence(建立新 incident、帶
+        // recurrence_of),而不是 Append 到已經 Resolved 的舊 incident 上
+        // ——這也間接證明 Resolved 之後舊 incident 已經被踢出 `active`
+        // (否則 handle_append 會直接改到 id 身上,不會有新 id 誕生)。
+        recorder.submit(make_incident("idles then resolves"));
+        wait_until(
+            || {
+                sink.calls
+                    .lock()
+                    .unwrap()
+                    .write_json
+                    .iter()
+                    .any(|i| i.recurrence_of.as_deref() == Some(id.as_str()))
+            },
+            StdDuration::from_secs(3),
+        );
+        let recurrence = sink
+            .calls
+            .lock()
+            .unwrap()
+            .write_json
+            .iter()
+            .rev()
+            .find(|i| i.recurrence_of.as_deref() == Some(id.as_str()))
+            .cloned()
+            .unwrap();
+        assert_ne!(recurrence.id, id, "recurrence 應該是一筆新的 incident");
+    }
+
+    /// 修 verifier 抓到的 MEDIUM 問題:一次 Tick 到期一大批(例如重啟後
+    /// 長時間停機累積下來)不應該一次全部處理完(每筆都要 fork 一個 `uv`
+    /// 分析器子行程,會讓 intake 執行緒卡住)——直接呼叫 `handle_tick`
+    /// (不透過 Recorder/背景執行緒,結果才不會受真實 1 秒 Tick 排程影響,
+    /// 一次呼叫就是一次 Tick)驗證:20 筆到期,第一次 Tick 只處理
+    /// `MAX_RESOLVES_PER_TICK`(16)筆,剩下的留到下一次 Tick。
+    #[test]
+    fn resolve_tick_caps_resolves_per_tick_oldest_first() {
+        let sink = FakeSink::new();
+        let mut cfg = incidents_cfg(1024, 8);
+        cfg.resolve_after_secs = 10;
+        let mut deduper = Deduper::new(cfg.clone());
+        let mut active = HashMap::new();
+        let base = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
+
+        const TOTAL: i64 = 20;
+        for i in 0..TOTAL {
+            let id = format!("id{i}");
+            let fp = format!("fp{i}");
+            // last_seen 各不相同,全部都遠遠超過 resolve_after_secs(10s)
+            // ——用來確認「舊的優先」:last_seen 越小(越舊)的 i 應該先被
+            // resolve_due 排到前面、優先在第一次 Tick 被處理掉。
+            let last_seen = base - ChronoDuration::seconds(1000 - i);
+            deduper.restore(
+                fp.clone(),
+                Entry {
+                    id: id.clone(),
+                    status: IncidentStatus::Open,
+                    first_seen: last_seen,
+                    last_seen,
+                    last_escalated: None,
+                },
+            );
+            let mut inc = make_incident(&format!("idle #{i}"));
+            inc.id = id.clone();
+            inc.fingerprint = Some(fp);
+            inc.last_seen = Some(last_seen);
+            active.insert(id, inc);
+        }
+
+        let mut state = IntakeState {
+            deduper,
+            active,
+            fp_active: HashMap::new(),
+            dirty: HashSet::new(),
+            last_flush: HashMap::new(),
+            pending: HashSet::new(),
+        };
+        let overflow = Arc::new(Mutex::new(HashMap::new()));
+        let now = base;
+
+        handle_tick(&mut state, sink.as_ref(), &overflow, ChronoDuration::seconds(3600), now);
+        assert_eq!(
+            state.active.len(),
+            (TOTAL as usize) - MAX_RESOLVES_PER_TICK,
+            "第一次 Tick 之後,`active` 應該只剩下沒被這次處理到的那些"
+        );
+        let resolved_after_first: Vec<String> = sink
+            .calls
+            .lock()
+            .unwrap()
+            .write_json
+            .iter()
+            .filter(|i| i.status == IncidentStatus::Resolved)
+            .map(|i| i.id.clone())
+            .collect();
+        assert_eq!(
+            resolved_after_first.len(),
+            MAX_RESOLVES_PER_TICK,
+            "第一次 Tick 應該只處理上限筆數"
+        );
+        // 舊的優先:last_seen 最小(i 最小)的那 MAX_RESOLVES_PER_TICK 筆應該
+        // 是這次被處理掉的那些。
+        let expected_first: HashSet<String> = (0..MAX_RESOLVES_PER_TICK as i64)
+            .map(|i| format!("id{i}"))
+            .collect();
+        let actual_first: HashSet<String> = resolved_after_first.into_iter().collect();
+        assert_eq!(
+            actual_first, expected_first,
+            "應該優先處理 last_seen 最舊(最逾期)的那些"
+        );
+
+        // 第二次 Tick:剩下的 4 筆應該被處理完,沒有任何一筆被無限期跳過。
+        handle_tick(&mut state, sink.as_ref(), &overflow, ChronoDuration::seconds(3600), now);
+        assert_eq!(state.active.len(), 0, "第二次 Tick 之後應該全部處理完");
+        let resolved_total = sink
+            .calls
+            .lock()
+            .unwrap()
+            .write_json
+            .iter()
+            .filter(|i| i.status == IncidentStatus::Resolved)
+            .count();
+        assert_eq!(resolved_total, TOTAL as usize);
     }
 }

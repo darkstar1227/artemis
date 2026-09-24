@@ -27,7 +27,7 @@ use std::collections::HashMap;
 pub struct Entry {
     pub id: String,
     pub status: IncidentStatus,
-    #[allow(dead_code)] // 尚無讀取端;step 5(resolve_due 排程/啟動重建)會用到。
+    #[allow(dead_code)] // 目前只有寫入端(on_new/on_recurrence/restore),尚無任何讀取端。
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     /// 最近一次「實際升級處置」(呼叫 agent_service)的時間;從未升級過則為 None。
@@ -77,6 +77,15 @@ impl StormGuard {
     fn evict_old(&mut self, now: DateTime<Utc>) {
         let cutoff = now - Duration::hours(1);
         self.timestamps.retain(|ts| *ts > cutoff);
+    }
+
+    /// 啟動重建(Milestone 1 step 5)用:把重啟前「過去一小時內的升級處置」
+    /// 時間戳灌回去,讓 storm guard 的滑動視窗額度不會在重啟瞬間憑空恢復成
+    /// 滿額。呼叫端(`recorder.rs::rebuild_state`)負責只傳一小時內的時間戳
+    /// 進來;這裡仍然呼叫一次 `evict_old` 保險,不假設呼叫端一定過濾乾淨。
+    fn restore(&mut self, timestamps: Vec<DateTime<Utc>>, now: DateTime<Utc>) {
+        self.timestamps = timestamps;
+        self.evict_old(now);
     }
 
     /// 目前這個時間點是否還有額度可以升級處置(不消耗額度,純查詢)。
@@ -273,18 +282,71 @@ impl Deduper {
         }
     }
 
-    /// 找出所有處於 Open/Mitigated 狀態、且 last_seen 已經超過
-    /// `resolve_after_secs` 的指紋,回傳它們目前的 Incident id;呼叫端負責
-    /// 把對應的 Incident 標記為 Resolved,並透過 `set_status` 回報。
-    #[allow(dead_code)] // recorder.rs 的 Tick 尚未接上(step 5 的 TODO,見 handle_tick 註解)。
+    /// 啟動重建(Milestone 1 step 5)專用:直接插入一筆從舊 JSON 重建出來的
+    /// entry(蓋掉同指紋既有的,啟動時 `entries` 本來就是空的,不會真的蓋到
+    /// 任何東西)。跟 `on_new`/`on_recurrence` 不同,這裡不消耗/影響 storm
+    /// guard——storm guard 的額度重建是 `seed_storm` 的職責,兩者分開呼叫。
+    pub fn restore(&mut self, fp: String, entry: Entry) {
+        self.entries.insert(fp, entry);
+    }
+
+    /// 啟動重建專用:見 `StormGuard::restore` 的文件——把重啟前一小時內的
+    /// 升級處置時間戳灌回滑動視窗計數器。
+    pub fn seed_storm(&mut self, timestamps: Vec<DateTime<Utc>>, now: DateTime<Utc>) {
+        self.storm.restore(timestamps, now);
+    }
+
+    /// 找出所有處於 Open/Mitigated/Suppressed 狀態、且 last_seen 已經超過
+    /// `resolve_after_secs` 的指紋,回傳它們目前的 Incident id,**依
+    /// `last_seen` 由舊到新(最逾期的排最前面)排序**——呼叫端(`recorder.rs`
+    /// 的 `handle_tick`)如果每個 Tick 只處理得完前面一部分(見那裡的
+    /// `MAX_RESOLVES_PER_TICK`),這個順序保證優先處理的一定是逾期最久的,
+    /// 不會有某個 entry 因為 HashMap 迭代順序不固定而一直排不到、無限期
+    /// 餓死——沒被這次處理到的,下一次 Tick 重新呼叫 `resolve_due` 時仍然
+    /// 會在(因為它們的狀態還沒被改成 Resolved),而且排序只會讓它們更靠前。
+    /// 呼叫端負責把對應的 Incident 標記為 Resolved,並透過 `set_status`
+    /// 回報。
+    ///
+    /// Milestone 1 step 5 決定:`Suppressed`(不論原因是 storm/cooldown/
+    /// queue_full)閒置超過 `resolve_after_secs` 沒有再出現,也視同「自然
+    /// 解決」一起標記為 Resolved——理由是它代表的錯誤已經不再發生,继续让
+    /// 它以 Suppressed 停留在 `active`/entries 裡沒有任何好處,只會讓這兩個
+    /// map 隨時間無限增長;之後如果同一種錯誤真的又出現,會被當成一次全新
+    /// 的 recurrence 重新評估是否升級,而不是永遠卡在「被抑制」的狀態。
     pub fn resolve_due(&self, now: DateTime<Utc>) -> Vec<String> {
         let threshold = Duration::seconds(self.cfg.resolve_after_secs as i64);
-        self.entries
+        let mut due: Vec<&Entry> = self
+            .entries
             .values()
-            .filter(|e| matches!(e.status, IncidentStatus::Open | IncidentStatus::Mitigated))
+            .filter(|e| {
+                matches!(
+                    e.status,
+                    IncidentStatus::Open | IncidentStatus::Mitigated | IncidentStatus::Suppressed
+                )
+            })
             .filter(|e| now - e.last_seen > threshold)
-            .map(|e| e.id.clone())
-            .collect()
+            .collect();
+        due.sort_by_key(|e| e.last_seen);
+        due.into_iter().map(|e| e.id.clone()).collect()
+    }
+
+    /// 修剪已經 Resolved、且久到不會再影響任何未來決策的 entry,避免
+    /// `entries` map 隨行程長時間執行無限增長。
+    ///
+    /// 為什麼這個 horizon 是安全的:`decide()` 只在兩種情況下用到 Resolved
+    /// entry——(a) 還在 dedup window 內又出現 → 強制視為 recurrence(而非
+    /// Append);(b) 視窗外 → 一樣走 recurrence,並用 `last_escalated` 判斷
+    /// cooldown 是否已過。一旦 `now - last_seen` 超過
+    /// `max(cooldown_secs, resolve_after_secs)`,dedup window 必然也早已過
+    /// (`resolve_after_secs` 依 config 驗證規則 ≥ `dedup_window_secs`),且
+    /// cooldown 必然也早已過——所以就算這筆 entry 被刪掉、之後同指紋再出現
+    /// 被 `decide_new` 當成全新事件處理,結果(建立新 incident、視情況升級)
+    /// 跟被判成 recurrence 幾乎一樣,唯一差別只是少了 `recurrence_of` 這個
+    /// 溯源欄位——可接受的代價換取 entries map 有界。
+    pub fn prune_expired(&mut self, now: DateTime<Utc>) {
+        let horizon = Duration::seconds(self.cfg.cooldown_secs.max(self.cfg.resolve_after_secs) as i64);
+        self.entries
+            .retain(|_, e| !(e.status == IncidentStatus::Resolved && now - e.last_seen > horizon));
     }
 }
 
@@ -535,12 +597,37 @@ mod tests {
     }
 
     #[test]
-    fn resolve_due_ignores_resolved_and_suppressed() {
+    fn resolve_due_ignores_resolved_but_includes_suppressed() {
         let mut d = Deduper::new(cfg(300, 1800, 3600, 6));
         d.decide("fp1", t(0));
         d.on_new("fp1".into(), "id1".into(), IncidentStatus::Open, t(0), true);
         d.set_status("fp1", IncidentStatus::Resolved);
-
         assert!(d.resolve_due(t(10_000)).is_empty());
+
+        // Suppressed 不再被忽略(Milestone 1 step 5 決定,見 `resolve_due`
+        // 文件):閒置超過 resolve_after_secs 也要被判定為到期。
+        d.decide("fp2", t(0));
+        d.on_new("fp2".into(), "id2".into(), IncidentStatus::Suppressed, t(0), false);
+        assert_eq!(d.resolve_due(t(10_000)), vec!["id2".to_string()]);
+    }
+
+    #[test]
+    fn resolve_due_returns_oldest_last_seen_first() {
+        let mut d = Deduper::new(cfg(300, 1800, 10, 6));
+        d.decide("fp1", t(0));
+        d.on_new("fp1".into(), "id1".into(), IncidentStatus::Open, t(0), true);
+        d.decide("fp2", t(5));
+        d.on_new("fp2".into(), "id2".into(), IncidentStatus::Open, t(5), true);
+        d.decide("fp3", t(2));
+        d.on_new("fp3".into(), "id3".into(), IncidentStatus::Open, t(2), true);
+
+        // 全部都已逾期(resolve_after_secs = 10),排序應該是 last_seen 由
+        // 舊到新:id1(t=0) < id3(t=2) < id2(t=5)——呼叫端只處理得完一部分時
+        // (見 recorder.rs 的 MAX_RESOLVES_PER_TICK)才不會有 entry 因為
+        // HashMap 迭代順序不固定而被無限期跳過。
+        assert_eq!(
+            d.resolve_due(t(1000)),
+            vec!["id1".to_string(), "id3".to_string(), "id2".to_string()]
+        );
     }
 }
