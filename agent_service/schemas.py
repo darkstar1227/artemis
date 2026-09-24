@@ -6,9 +6,11 @@ so the JSON on both sides stays a straightforward 1:1 mapping.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AgentRoleConfig(BaseModel):
@@ -63,6 +65,20 @@ class EscalationSettings(BaseModel):
     execution_api_key_env: Optional[str] = None
 
 
+class DiagnosticSample(BaseModel):
+    """Mirrors src/incident.rs::DiagnosticSample — documents the shape of
+    entries inside incident["diagnostics_history"]. incident itself stays an
+    untyped dict (see EscalateRequest below), so this model is not used to
+    parse/validate incident content; it's here purely so the contract with
+    the Rust side stays legible from this file, matching this module's
+    field-for-field mirroring convention."""
+
+    ts_ms: int
+    command: str
+    output: str
+    exit_code: int
+
+
 class EscalateRequest(BaseModel):
     incident: dict[str, Any]
     cwd: str
@@ -70,6 +86,35 @@ class EscalateRequest(BaseModel):
     orchestrator: OrchestratorConfig
     agents: AgentsConfig
     remote: RemoteConfig = Field(default_factory=RemoteConfig)
+
+    @field_validator("cwd")
+    @classmethod
+    def _validate_cwd(cls, v: str) -> str:
+        """Reject an unconfined cwd before it ever reaches tools.py's
+        path-confinement checks — those only guard paths *relative to* cwd,
+        so a cwd of "/" (or any non-directory / nonexistent path) would
+        defeat confinement entirely rather than just misbehave."""
+        p = Path(v)
+        if not p.is_absolute():
+            raise ValueError(f"cwd 必須是絕對路徑:{v}")
+        resolved = p.resolve()
+        if not resolved.exists():
+            raise ValueError(f"cwd 不存在:{v}")
+        if not resolved.is_dir():
+            raise ValueError(f"cwd 必須是目錄:{v}")
+        if resolved == resolved.parent:
+            raise ValueError(f"cwd 不可以是檔案系統根目錄:{v}")
+
+        allowed_roots = os.environ.get("ARTEMIS_ALLOWED_CWD_ROOTS")
+        if allowed_roots:
+            roots = [Path(r).resolve() for r in allowed_roots.split(os.pathsep) if r]
+            if roots and not any(
+                resolved == root or root in resolved.parents for root in roots
+            ):
+                raise ValueError(
+                    f"cwd 不在 ARTEMIS_ALLOWED_CWD_ROOTS 允許的範圍內:{v}"
+                )
+        return str(resolved)
 
 
 class StageResult(BaseModel):

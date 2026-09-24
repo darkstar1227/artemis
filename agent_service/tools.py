@@ -62,11 +62,20 @@ def _resolve_within_cwd(ctx: StageContext, path: str) -> Path:
     return resolved
 
 
+def _resolve_config_entry(ctx: StageContext, entry: str) -> Path:
+    """Resolve a stage3_config_files entry the same way an incoming edit path
+    is resolved: relative entries (e.g. "./config/app.toml") are relative to
+    the target repo's cwd, not the agent_service process's own cwd; absolute
+    entries are used as-is."""
+    p = Path(entry)
+    return p.resolve() if p.is_absolute() else (ctx.cwd / p).resolve()
+
+
 def _check_editable(ctx: StageContext, path: str) -> None:
     if not ctx.editable_files:
         return  # unrestricted (stage3)
     resolved = str(_resolve_within_cwd(ctx, path))
-    allowed = {str(Path(p).resolve()) for p in ctx.editable_files}
+    allowed = {str(_resolve_config_entry(ctx, p)) for p in ctx.editable_files}
     if resolved not in allowed:
         raise PermissionDenied(
             f"此階段只能編輯以下檔案:{', '.join(ctx.editable_files)},拒絕存取:{path}"
@@ -137,15 +146,11 @@ def list_dir(wrapper: RunContextWrapper[StageContext], path: str = ".") -> str:
     return out
 
 
-@function_tool
-def grep_files(wrapper: RunContextWrapper[StageContext], pattern: str, path: str = ".") -> str:
-    """在專案目錄下搜尋符合正規表示式的檔案內容(類似 grep -rn),協助在不知道確切檔名時定位相關程式碼。
-
-    Args:
-        pattern: 要搜尋的正規表示式。
-        path: 搜尋範圍,可以是單一檔案或目錄(相對於專案目錄),預設為專案根目錄。
-    """
-    ctx = wrapper.context
+def _grep_scan(ctx: StageContext, pattern: str, path: str) -> str:
+    """Pure implementation behind grep_files, kept separate from the
+    @function_tool wrapper so it can be unit-tested directly (the SDK's
+    FunctionTool wrapping makes the decorated function itself awkward to
+    invoke outside a real agent run)."""
     resolved = _resolve_within_cwd(ctx, path)
     if not resolved.exists():
         return f"[錯誤] 路徑不存在:{path}"
@@ -160,8 +165,16 @@ def grep_files(wrapper: RunContextWrapper[StageContext], pattern: str, path: str
     for f in candidates:
         if not f.is_file() or _SKIP_DIR_NAMES & set(f.relative_to(root).parts[:-1]):
             continue
+        # f may be reached through a symlink inside the tree that points
+        # outside cwd (e.g. a symlinked file or an ancestor symlinked dir) —
+        # resolve it and re-check confinement before reading its content.
         try:
-            text = f.read_text(encoding="utf-8", errors="replace")
+            real = f.resolve()
+            real.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        try:
+            text = real.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         for i, line in enumerate(text.splitlines(), start=1):
@@ -178,6 +191,17 @@ def grep_files(wrapper: RunContextWrapper[StageContext], pattern: str, path: str
     if len(matches) >= GREP_MAX_MATCHES:
         out += f"\n\n[已截斷,已達最多 {GREP_MAX_MATCHES} 筆符合結果上限]"
     return out
+
+
+@function_tool
+def grep_files(wrapper: RunContextWrapper[StageContext], pattern: str, path: str = ".") -> str:
+    """在專案目錄下搜尋符合正規表示式的檔案內容(類似 grep -rn),協助在不知道確切檔名時定位相關程式碼。
+
+    Args:
+        pattern: 要搜尋的正規表示式。
+        path: 搜尋範圍,可以是單一檔案或目錄(相對於專案目錄),預設為專案根目錄。
+    """
+    return _grep_scan(wrapper.context, pattern, path)
 
 
 @function_tool

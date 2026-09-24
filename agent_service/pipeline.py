@@ -40,6 +40,10 @@ _JSON_BLOCK_RE = re.compile(r"```json(.*?)```", re.DOTALL)
 # 採同樣量級,同樣附上可辨識的截斷標記而不是靜默丟資料。
 INCIDENT_RAW_MAX_CHARS = 20000
 INCIDENT_FRAMES_MAX = 50
+# 診斷歷史(diagnostics_history,見 src/incident.rs::DiagnosticSample)一樣會被
+# 嵌進每個 stage/judgment prompt,採同樣的截斷慣例。
+INCIDENT_DIAGNOSTICS_MAX_CHARS = 6000
+INCIDENT_DIAGNOSTICS_PER_COMMAND_MAX = 5
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -60,6 +64,38 @@ def extract_json_block(text: str) -> dict | None:
         return None
 
 
+def _diagnostics_section(incident: dict) -> str:
+    """Render incident["diagnostics_history"] (Vec<DiagnosticSample> on the
+    Rust side, src/incident.rs ~40-47) grouped by command, most recent
+    samples first, so the stage/judgment agents can see pre-incident resource
+    trends without every sample from every poll blowing up the prompt."""
+    samples = incident.get("diagnostics_history") or []
+    if not samples:
+        return ""
+
+    by_command: dict[str, list[dict]] = {}
+    for s in samples:
+        by_command.setdefault(s.get("command", ""), []).append(s)
+
+    lines: list[str] = []
+    for command, cmd_samples in by_command.items():
+        cmd_samples = sorted(cmd_samples, key=lambda s: s.get("ts_ms", 0), reverse=True)
+        lines.append(f"  指令:{command}")
+        for s in cmd_samples[:INCIDENT_DIAGNOSTICS_PER_COMMAND_MAX]:
+            lines.append(
+                f"    - ts_ms={s.get('ts_ms')} exit_code={s.get('exit_code')} "
+                f"output={s.get('output', '')!r}"
+            )
+        if len(cmd_samples) > INCIDENT_DIAGNOSTICS_PER_COMMAND_MAX:
+            lines.append(
+                f"    ...(還有 {len(cmd_samples) - INCIDENT_DIAGNOSTICS_PER_COMMAND_MAX} "
+                "筆較舊的樣本,已省略)"
+            )
+
+    section = "\n".join(lines)
+    return "\n事故前診斷歷史:\n" + _truncate(section, INCIDENT_DIAGNOSTICS_MAX_CHARS)
+
+
 def incident_context(incident: dict) -> str:
     frames = incident.get("frames") or []
     frame_lines = "\n".join(f"  - {f.get('raw', '')}" for f in frames[:INCIDENT_FRAMES_MAX])
@@ -72,6 +108,7 @@ def incident_context(incident: dict) -> str:
         f"錯誤訊息:{incident.get('message')}\n"
         f"堆疊/相關內容:\n{frame_lines}\n"
         f"原始輸出:\n{raw}"
+        f"{_diagnostics_section(incident)}"
     )
 
 

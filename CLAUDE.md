@@ -249,6 +249,11 @@ Python, `uv`-managed, built on the **OpenAI Agents SDK**. Files:
   (`INCIDENT_RAW_MAX_CHARS`/`INCIDENT_FRAMES_MAX`) before embedding it into every stage/judgment
   prompt — same rationale as `READ_FILE_MAX_CHARS` below, but this one matters more because a
   single incident's context gets re-embedded into several independent `Runner.run()` calls.
+  It also renders `incident["diagnostics_history"]` (the Rust side's rolling pre-incident
+  `DiagnosticSample` history, src/incident.rs), grouped by command with most-recent-first and capped
+  at `INCIDENT_DIAGNOSTICS_MAX_CHARS`, so stage/judgment agents see resource trends leading up to the
+  incident, not just the moment it fired. Missing/empty `diagnostics_history` is tolerated (older
+  incidents, or Rust configs with diagnostics disabled).
 - `main.py` — the FastAPI app (`GET /health`, `POST /escalate`).
 - `tests/` — mock-LLM smoke tests (see Commands above); not part of the shipped service.
 
@@ -266,6 +271,18 @@ reach the port can make it run arbitrary commands against the target repo. `read
 returned content at `tools.py::READ_FILE_MAX_CHARS` (20,000 chars, truncated with a marker) so a
 large/binary file can't blow up an agent's context window or cost; `list_dir`/`grep_files` have
 their own caps (`LIST_DIR_MAX_ENTRIES`, `GREP_MAX_MATCHES`/`GREP_MAX_CHARS`) for the same reason.
+`grep_files` also re-resolves each candidate file before reading it, so a symlink inside `cwd`
+pointing outside it is skipped rather than read.
+
+`EscalateRequest.cwd` (`schemas.py`) is validated on every `/escalate` call (a pydantic
+`field_validator`, rejected as HTTP 422): must be an absolute, existing directory, and not the
+filesystem root — `cwd="/"` no longer defeats every tool's path confinement. If the environment
+`agent_service` runs in sets `ARTEMIS_ALLOWED_CWD_ROOTS` (a `os.pathsep`-separated list of
+directories), the resolved `cwd` must additionally be one of, or nested under, one of those roots;
+unset, any absolute existing non-root directory is accepted (same as before this check existed).
+`escalation.stage3_config_files` entries that are relative (e.g. `"./config/app.toml"`) are resolved
+against the request's `cwd`, not `agent_service`'s own process cwd — a relative entry used to never
+match and silently deny every stage2 edit.
 
 ### Multi-host / multi-project (src/central_client.rs, agent_service/central.py)
 
@@ -289,7 +306,12 @@ doesn't pay a ~30MB interpreter download. `agent_service/Dockerfile` builds the 
 `docker-compose.example.yml` shows one shared `agent_service` + one `artemis watch` service per
 project. Both Dockerfiles have matching `.dockerignore`s — without them, a host-built `.venv` gets
 copied into the image with a broken interpreter symlink (harmless but forces a venv rebuild at
-container start).
+container start). `agent_service`'s port is **not** published to the host by default in the example
+compose file — `artemis watch` containers reach it over the compose network at
+`http://agent_service:8787`; `ARTEMIS_AGENT_SERVICE_TOKEN` is a required env var there (compose
+fails fast if unset) since an unauthenticated `/escalate` is remote code execution against the
+mounted project. If you need host access for debugging, uncomment the `ports` line and bind it to
+`127.0.0.1` only, never publish it on `0.0.0.0`.
 
 ### Python analyzer (analyzer/analyze.py)
 
