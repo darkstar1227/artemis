@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::incident::{Incident, Severity, Source};
 use crate::matcher::{LiveScanner, StreamMatcher};
-use crate::store::Store;
+use crate::recorder::Recorder;
+use crate::shutdown::{self, ShutdownFlag};
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -15,7 +16,7 @@ use std::time::Duration;
 /// thread 先把 tx 都 drop 掉導致 Disconnected)遺漏最後幾筆錯誤事件。
 fn drain_events(
     rx: &mpsc::Receiver<crate::matcher::ErrorEvent>,
-    store: &Store,
+    recorder: &Recorder,
     cfg: &Config,
     restart_count: u32,
 ) {
@@ -32,9 +33,7 @@ fn drain_events(
             restart_count,
             Severity::High,
         );
-        if let Err(e) = store.record(incident, cfg) {
-            eprintln!("[artemis] 記錄事件失敗:{e}");
-        }
+        recorder.submit(incident);
     }
 }
 
@@ -44,7 +43,7 @@ fn drain_events(
 /// `exit_code.unwrap_or(0) != 0` 會誤判為正常結束、不記錄事件也不重啟。
 fn handle_exit(
     status: std::process::ExitStatus,
-    store: &Store,
+    recorder: &Recorder,
     cfg: &Config,
     restart_count: u32,
 ) -> bool {
@@ -90,7 +89,7 @@ fn handle_exit(
         restart_count,
         Severity::Critical,
     );
-    let _ = store.record(incident, cfg);
+    recorder.submit(incident);
 
     cfg.auto_restart && restart_count < cfg.max_restarts
 }
@@ -119,7 +118,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     })
 }
 
-pub fn watch(cfg: &Config, store: &Store) -> Result<()> {
+pub fn watch(cfg: &Config, recorder: &Recorder, shutdown: &ShutdownFlag) -> Result<()> {
     let matcher = Arc::new(StreamMatcher::new(&cfg.error_patterns)?);
     let mut restart_count = 0u32;
 
@@ -156,16 +155,32 @@ pub fn watch(cfg: &Config, store: &Store) -> Result<()> {
                         restart_count,
                         Severity::High,
                     );
-                    if let Err(e) = store.record(incident, cfg) {
-                        eprintln!("[artemis] 記錄事件失敗:{e}");
-                    }
+                    recorder.submit(incident);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if shutdown::is_set(shutdown) {
+                        // 收到關閉要求(SIGTERM/SIGINT,或另一個監看執行緒先
+                        // 結束觸發的關閉):不等被監控程序自己結束,直接送
+                        // kill。這裡選最簡單的做法(`child.kill()`,等同
+                        // SIGKILL)而不是先送 SIGTERM 再等——被監控程序本來就
+                        // 不是 artemis 自己的常駐服務,沒有必要在關閉路徑上
+                        // 為它多留一段「優雅退出」的等待時間;真正需要保留
+                        // 狀態的是 incident 落地與升級處置,那部分由
+                        // `Recorder::shutdown_and_join` 的 grace period 負責。
+                        eprintln!("[artemis] 收到關閉要求,終止被監控程序並停止監看");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = h_out.join();
+                        let _ = h_err.join();
+                        drain_events(&rx, recorder, cfg, restart_count);
+                        return Ok(());
+                    }
                     if let Ok(Some(status)) = child.try_wait() {
                         let _ = h_out.join();
                         let _ = h_err.join();
-                        drain_events(&rx, store, cfg, restart_count);
-                        let should_restart = handle_exit(status, store, cfg, restart_count);
+                        drain_events(&rx, recorder, cfg, restart_count);
+                        let should_restart = handle_exit(status, recorder, cfg, restart_count)
+                            && !shutdown::is_set(shutdown);
 
                         if should_restart {
                             restart_count += 1;
@@ -190,9 +205,10 @@ pub fn watch(cfg: &Config, store: &Store) -> Result<()> {
                     // exit status 判斷是否崩潰。
                     let _ = h_out.join();
                     let _ = h_err.join();
-                    drain_events(&rx, store, cfg, restart_count);
+                    drain_events(&rx, recorder, cfg, restart_count);
                     let status = child.wait().context("等待子程序結束失敗")?;
-                    let should_restart = handle_exit(status, store, cfg, restart_count);
+                    let should_restart = handle_exit(status, recorder, cfg, restart_count)
+                        && !shutdown::is_set(shutdown);
 
                     if should_restart {
                         restart_count += 1;

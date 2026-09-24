@@ -1,9 +1,8 @@
 //! 事件去重/冷卻的純邏輯層(Milestone 1, step 3)。
 //!
 //! 這個模組刻意不碰任何 I/O、系統時間或 `Store` —— 時間一律由呼叫端以
-//! `now: DateTime<Utc>` 參數傳入,方便測試用假時鐘驅動。目前還沒有任何
-//! production 路徑呼叫這裡的程式碼(那是下一步,Milestone 1 step 4 的工作),
-//! 所以現在接上這個檔案不會改變任何現有行為。
+//! `now: DateTime<Utc>` 參數傳入,方便測試用假時鐘驅動。從 Milestone 1
+//! step 4 起,`recorder.rs` 的 intake 執行緒是唯一呼叫這裡程式碼的地方。
 //!
 //! 核心規則(見 `Deduper::decide`):
 //! - 全新指紋,或舊指紋已經「太久沒出現」且從未被標記為 Mitigated/Resolved
@@ -24,11 +23,11 @@ use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 
 /// 單一指紋目前的去重狀態。
-#[allow(dead_code)] // Milestone 1 step 4 起才會被 Store/recorder 建構、讀取。
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub id: String,
     pub status: IncidentStatus,
+    #[allow(dead_code)] // 尚無讀取端;step 5(resolve_due 排程/啟動重建)會用到。
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     /// 最近一次「實際升級處置」(呼叫 agent_service)的時間;從未升級過則為 None。
@@ -37,7 +36,6 @@ pub struct Entry {
 
 /// `Deduper::decide` 的判斷結果。呼叫端根據這個結果建立/更新 Incident,並回呼
 /// `Deduper::on_new`/`on_append` 讓內部狀態表跟著同步。
-#[allow(dead_code)] // Milestone 1 step 4 起才會被 Store/recorder 使用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// 全新事件,應該建立新 Incident 並(可以的話)升級處置。
@@ -68,7 +66,6 @@ pub struct StormGuard {
     timestamps: Vec<DateTime<Utc>>,
 }
 
-#[allow(dead_code)] // Milestone 1 step 4 起才會被 Deduper 之外的地方直接使用。
 impl StormGuard {
     pub fn new(max_per_hour: u32) -> Self {
         Self {
@@ -99,17 +96,12 @@ impl StormGuard {
 }
 
 /// 事件去重/冷卻狀態機。`entries` 以指紋(fingerprint)為 key。
-///
-/// `#[allow(dead_code)]` on the impl below: nothing calls into this module
-/// from a production path yet (Milestone 1 step 4 wires it into
-/// `Store`/the recorder) — remove once that lands.
 pub struct Deduper {
     entries: HashMap<String, Entry>,
     storm: StormGuard,
     cfg: IncidentsConfig,
 }
 
-#[allow(dead_code)] // Milestone 1 step 4 起才會被 Store/recorder 呼叫。
 impl Deduper {
     pub fn new(cfg: IncidentsConfig) -> Self {
         let storm = StormGuard::new(cfg.max_escalations_per_hour);
@@ -284,6 +276,7 @@ impl Deduper {
     /// 找出所有處於 Open/Mitigated 狀態、且 last_seen 已經超過
     /// `resolve_after_secs` 的指紋,回傳它們目前的 Incident id;呼叫端負責
     /// 把對應的 Incident 標記為 Resolved,並透過 `set_status` 回報。
+    #[allow(dead_code)] // recorder.rs 的 Tick 尚未接上(step 5 的 TODO,見 handle_tick 註解)。
     pub fn resolve_due(&self, now: DateTime<Utc>) -> Vec<String> {
         let threshold = Duration::seconds(self.cfg.resolve_after_secs as i64);
         self.entries

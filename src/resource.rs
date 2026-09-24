@@ -1,14 +1,14 @@
 use crate::config::Config;
 use crate::incident::{Incident, Severity, Source};
-use crate::store::Store;
+use crate::recorder::Recorder;
+use crate::shutdown::{self, ShutdownFlag};
 use anyhow::Result;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 use sysinfo::{Disks, System};
 
 /// 定期輪詢系統資源(CPU/記憶體/磁碟),超過設定門檻就記錄一個事件並觸發處置。
-pub fn watch_resources(cfg: Arc<Config>, store: Arc<Store>) -> Result<()> {
+pub fn watch_resources(cfg: Arc<Config>, recorder: Recorder, shutdown: ShutdownFlag) -> Result<()> {
     if !cfg.resources.enabled {
         return Ok(());
     }
@@ -19,6 +19,9 @@ pub fn watch_resources(cfg: Arc<Config>, store: Arc<Store>) -> Result<()> {
     let mut last_mem_alert = false;
 
     loop {
+        if shutdown::is_set(&shutdown) {
+            return Ok(());
+        }
         sys.refresh_cpu_usage();
         sys.refresh_memory();
         let cpu = sys.global_cpu_usage();
@@ -42,19 +45,19 @@ pub fn watch_resources(cfg: Arc<Config>, store: Arc<Store>) -> Result<()> {
             .fold(0.0_f32, f32::max);
 
         if cpu >= cfg.resources.cpu_percent && !last_cpu_alert {
-            emit(&cfg, &store, format!("CPU 使用率過高:{cpu:.1}% (門檻 {:.1}%)", cfg.resources.cpu_percent));
+            emit(&cfg, &recorder, format!("CPU 使用率過高:{cpu:.1}% (門檻 {:.1}%)", cfg.resources.cpu_percent));
         }
         if mem_percent >= cfg.resources.memory_percent && !last_mem_alert {
             emit(
                 &cfg,
-                &store,
+                &recorder,
                 format!("記憶體使用率過高:{mem_percent:.1}% (門檻 {:.1}%)", cfg.resources.memory_percent),
             );
         }
         if disk_percent >= cfg.resources.disk_percent && !last_disk_alert {
             emit(
                 &cfg,
-                &store,
+                &recorder,
                 format!("磁碟使用率過高:{disk_percent:.1}% (門檻 {:.1}%)", cfg.resources.disk_percent),
             );
         }
@@ -63,11 +66,11 @@ pub fn watch_resources(cfg: Arc<Config>, store: Arc<Store>) -> Result<()> {
         last_mem_alert = mem_percent >= cfg.resources.memory_percent;
         last_disk_alert = disk_percent >= cfg.resources.disk_percent;
 
-        thread::sleep(Duration::from_millis(cfg.resources.poll_interval_ms));
+        shutdown::sleep_interruptible(&shutdown, Duration::from_millis(cfg.resources.poll_interval_ms));
     }
 }
 
-fn emit(cfg: &Config, store: &Store, message: String) {
+fn emit(cfg: &Config, recorder: &Recorder, message: String) {
     let incident = Incident::detected(
         cfg.name.clone(),
         Source::LogFile("system-resources".into()),
@@ -80,7 +83,5 @@ fn emit(cfg: &Config, store: &Store, message: String) {
         0,
         Severity::Medium,
     );
-    if let Err(e) = store.record(incident, cfg) {
-        eprintln!("[artemis] 記錄資源事件失敗:{e}");
-    }
+    recorder.submit(incident);
 }

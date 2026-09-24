@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::incident::{Incident, Severity, Source};
 use crate::matcher::{LiveScanner, StreamMatcher};
-use crate::store::Store;
+use crate::recorder::Recorder;
+use crate::shutdown::{self, ShutdownFlag};
 use anyhow::Result;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 /// 以輪詢方式監看額外指定的 log 檔案(除了被監控程序本身的 stdout/stderr),
 /// 偵測到新增內容中出現錯誤特徵時記錄事件。
-pub fn watch_log_files(cfg: Arc<Config>, store: Arc<Store>) -> Result<()> {
+pub fn watch_log_files(cfg: Arc<Config>, recorder: Recorder, shutdown: ShutdownFlag) -> Result<()> {
     if cfg.log_files.is_empty() {
         return Ok(());
     }
@@ -21,10 +22,11 @@ pub fn watch_log_files(cfg: Arc<Config>, store: Arc<Store>) -> Result<()> {
     let mut handles = Vec::new();
     for path in cfg.log_files.clone() {
         let cfg = cfg.clone();
-        let store = store.clone();
+        let recorder = recorder.clone();
         let matcher = matcher.clone();
+        let shutdown = shutdown.clone();
         handles.push(thread::spawn(move || {
-            if let Err(e) = tail_one(&path, cfg, store, matcher) {
+            if let Err(e) = tail_one(&path, cfg, recorder, matcher, shutdown) {
                 eprintln!("[artemis] 監看 log 檔案失敗 ({path}): {e}");
             }
         }));
@@ -38,12 +40,16 @@ pub fn watch_log_files(cfg: Arc<Config>, store: Arc<Store>) -> Result<()> {
 fn tail_one(
     path: &str,
     cfg: Arc<Config>,
-    store: Arc<Store>,
+    recorder: Recorder,
     matcher: Arc<StreamMatcher>,
+    shutdown: ShutdownFlag,
 ) -> Result<()> {
     let mut scanner = LiveScanner::new(&matcher);
 
     loop {
+        if shutdown::is_set(&shutdown) {
+            return Ok(());
+        }
         let file = match File::open(path) {
             Ok(f) => f,
             Err(_) => {
@@ -56,6 +62,9 @@ fn tail_one(
         reader.seek(SeekFrom::End(0))?;
 
         loop {
+            if shutdown::is_set(&shutdown) {
+                return Ok(());
+            }
             let mut line = String::new();
             let n = reader.read_line(&mut line)?;
             if n == 0 {
@@ -64,7 +73,7 @@ fn tail_one(
             }
             let line = line.trim_end_matches(['\n', '\r']);
             if let Some(event) = scanner.feed(line) {
-                record_log_incident(&cfg, &store, path, event);
+                record_log_incident(&cfg, &recorder, path, event);
             }
         }
     }
@@ -72,7 +81,7 @@ fn tail_one(
 
 fn record_log_incident(
     cfg: &Config,
-    store: &Store,
+    recorder: &Recorder,
     path: &str,
     event: crate::matcher::ErrorEvent,
 ) {
@@ -88,7 +97,5 @@ fn record_log_incident(
         0,
         Severity::High,
     );
-    if let Err(e) = store.record(incident, cfg) {
-        eprintln!("[artemis] 記錄事件失敗:{e}");
-    }
+    recorder.submit(incident);
 }

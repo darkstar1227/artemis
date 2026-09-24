@@ -1,5 +1,3 @@
-use crate::agent_client;
-use crate::central_client;
 use crate::config::Config;
 use crate::diagnostics;
 use crate::incident::{DiagnosticSample, Incident};
@@ -12,7 +10,9 @@ use std::process::Command;
 /// 「事故前 retention_mins 分鐘」的歷史樣本,依時間排序回傳給 Incident。
 /// 如果補跑的即時樣本跟 buffer 最後一筆同指令的時間差在 1 秒內,視為重複,
 /// 只保留一份(避免輪詢執行緒剛好也在同一刻寫入,報告裡出現看似重複的數字)。
-fn collect_diagnostics_history(cfg: &Config) -> Vec<DiagnosticSample> {
+///
+/// `recorder.rs` 的 `RealSink::snapshot_diagnostics` 是這個函式唯一的呼叫端。
+pub(crate) fn collect_diagnostics_history(cfg: &Config) -> Vec<DiagnosticSample> {
     let mut history = diagnostics::read_recent(cfg);
     let immediate = diagnostics::run_all(cfg);
 
@@ -29,6 +29,13 @@ fn collect_diagnostics_history(cfg: &Config) -> Vec<DiagnosticSample> {
     history
 }
 
+/// 事件記錄的底層 I/O 原語(JSON 落地、Markdown 報告、`list`/`show`)。
+///
+/// 從 Milestone 1 step 4 起,`record()` 這個「同步做完一切」的方法已經拆掉
+/// —— 實際的記錄流程(去重判斷、非同步升級處置)由 `recorder.rs` 的
+/// `Recorder`/intake 執行緒負責,透過 `RealSink`(包著這個 `Store`)呼叫
+/// `write_json`/`render_markdown` 等個別方法。`Store` 本身留下來只做兩件事:
+/// 這些底層 I/O 原語,以及 `list`/`show` 這兩個仍然同步、一次性的 CLI 指令。
 #[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
@@ -42,49 +49,30 @@ impl Store {
         Ok(Self { dir })
     }
 
-    fn json_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn json_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.json"))
     }
 
-    fn report_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn report_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.md"))
     }
 
-    /// 記錄一筆事件:先跑四層分級自主處置(若啟用),把處置結果附進事件裡,
-    /// 寫入 JSON,再呼叫 Python(以 uv 管理)進行根因分析,產生 Markdown 報告。
-    pub fn record(&self, mut incident: Incident, cfg: &Config) -> Result<PathBuf> {
-        eprintln!("[artemis] 偵測到事件:{} ({})", incident.id, incident.message);
-
-        if cfg.diagnostics.enabled && !cfg.diagnostics.commands.is_empty() {
-            incident.diagnostics_history = collect_diagnostics_history(cfg);
-        }
-
-        if cfg.escalation.enabled {
-            match agent_client::escalate(&incident, cfg) {
-                Ok(report) => incident.escalation = Some(report),
-                Err(e) => eprintln!("[artemis] AI 分級處置執行失敗,事件仍會照常記錄:{e}"),
-            }
-        }
-
+    /// 把事件寫入(或覆寫)JSON 檔案。呼叫端(`RealSink`)在初次記錄、
+    /// 次數累加的節流重寫、`EscalationDone` 之後的最終狀態更新時都呼叫這個
+    /// 方法 —— 是唯一的落地路徑。
+    pub fn write_json(&self, incident: &Incident) -> Result<PathBuf> {
         let json_path = self.json_path(&incident.id);
-        let body = serde_json::to_string_pretty(&incident)?;
+        let body = serde_json::to_string_pretty(incident)?;
         fs::write(&json_path, body)
             .with_context(|| format!("無法寫入事件記錄:{}", json_path.display()))?;
-
-        eprintln!("[artemis] 事件已記錄:{}", incident.id);
-
-        if let Err(e) = self.run_analyzer(&json_path, cfg) {
-            eprintln!("[artemis] 根因分析執行失敗,已保留原始事件 JSON:{e}");
-        }
-
-        if cfg.central.enabled {
-            let report_markdown = fs::read_to_string(self.report_path(&incident.id)).ok();
-            if let Err(e) = central_client::push(&incident, report_markdown.as_deref(), cfg) {
-                eprintln!("[artemis] 推送事件到 central collector 失敗,不影響本機記錄:{e}");
-            }
-        }
-
         Ok(json_path)
+    }
+
+    /// 呼叫 `uv` 執行根因分析腳本,產生 Markdown 報告。分析器失敗只回傳
+    /// `Err` 給呼叫端記 log,絕不影響已經寫入的事件 JSON。
+    pub fn render_markdown(&self, incident: &Incident, cfg: &Config) -> Result<()> {
+        let json_path = self.json_path(&incident.id);
+        self.run_analyzer(&json_path, cfg)
     }
 
     fn run_analyzer(&self, json_path: &Path, cfg: &Config) -> Result<()> {
