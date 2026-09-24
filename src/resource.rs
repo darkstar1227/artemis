@@ -81,6 +81,7 @@ fn emit(cfg: &Config, store: &Store, message: String) {
         restarted: false,
         restart_count: 0,
         escalation: None,
+        diagnostics_history: Vec::new(),
     };
     if let Err(e) = store.record(incident, cfg) {
         eprintln!("[artemis] 記錄資源事件失敗:{e}");

@@ -72,6 +72,7 @@ pub fn watch(cfg: &Config, store: &Store) -> Result<()> {
                         restarted: false,
                         restart_count,
                         escalation: None,
+                        diagnostics_history: Vec::new(),
                     };
                     if let Err(e) = store.record(incident, cfg) {
                         eprintln!("[artemis] 記錄事件失敗:{e}");
@@ -98,6 +99,7 @@ pub fn watch(cfg: &Config, store: &Store) -> Result<()> {
                                 restarted: cfg.auto_restart && restart_count < cfg.max_restarts,
                                 restart_count,
                                 escalation: None,
+                        diagnostics_history: Vec::new(),
                             };
                             let _ = store.record(incident, cfg);
                         }

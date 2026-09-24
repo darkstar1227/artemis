@@ -137,6 +137,50 @@ def render_multi_agent_analysis(analysis: dict | None) -> str:
     return "\n".join(lines)
 
 
+# 跟 agent_service/tools.py::READ_FILE_MAX_CHARS 同樣的理由:單一診斷指令的
+# 輸出理論上很小(docker stats/free -m/nvidia-smi 一行),但避免有人塞了會
+# 印很多行的指令進 [diagnostics].commands,還是設個上限保護報告可讀性。
+DIAGNOSTIC_OUTPUT_MAX_CHARS = 2000
+
+
+def render_diagnostics_history(samples: list) -> str:
+    if not samples:
+        return ""
+
+    from collections import OrderedDict
+    from datetime import datetime, timezone
+
+    by_command = OrderedDict()
+    for sample in sorted(samples, key=lambda s: s.get("ts_ms", 0)):
+        by_command.setdefault(sample.get("command", ""), []).append(sample)
+
+    lines = ["## 診斷數值(事故前歷史)", ""]
+    lines.append(
+        "以下是事故發生前(以及觸發當下補跑一次)的原始診斷指令輸出,"
+        "依指令分組、按時間排序,方便直接看出惡化過程,不需要另外查儀表板。"
+    )
+    lines.append("")
+
+    for command, entries in by_command.items():
+        lines.append(f"### `{command}`")
+        lines.append("")
+        for entry in entries:
+            ts = datetime.fromtimestamp(entry.get("ts_ms", 0) / 1000, tz=timezone.utc)
+            output = (entry.get("output") or "").strip()
+            if len(output) > DIAGNOSTIC_OUTPUT_MAX_CHARS:
+                output = output[:DIAGNOSTIC_OUTPUT_MAX_CHARS] + "\n[已截斷]"
+            exit_code = entry.get("exit_code")
+            lines.append(f"- **{ts.strftime('%Y-%m-%d %H:%M:%S UTC')}** (exit {exit_code})")
+            if output:
+                lines.append("  ```")
+                for out_line in output.splitlines():
+                    lines.append(f"  {out_line}")
+                lines.append("  ```")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def build_report(incident: dict, project_root: Path, context_lines: int) -> str:
     lines = []
     lines.append(f"# 事件報告:{incident['id']}")
@@ -148,6 +192,10 @@ def build_report(incident: dict, project_root: Path, context_lines: int) -> str:
     if incident.get("exit_code") is not None:
         lines.append(f"- Exit code:{incident['exit_code']}")
     lines.append("")
+
+    diagnostics_section = render_diagnostics_history(incident.get("diagnostics_history") or [])
+    if diagnostics_section:
+        lines.append(diagnostics_section)
 
     frames = incident.get("frames") or []
     if frames:

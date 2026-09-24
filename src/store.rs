@@ -1,11 +1,33 @@
 use crate::agent_client;
 use crate::central_client;
 use crate::config::Config;
-use crate::incident::Incident;
+use crate::diagnostics;
+use crate::incident::{DiagnosticSample, Incident};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// 事件觸發時,立刻補跑一次診斷指令拿「當下值」,再併入 rolling buffer 裡
+/// 「事故前 retention_mins 分鐘」的歷史樣本,依時間排序回傳給 Incident。
+/// 如果補跑的即時樣本跟 buffer 最後一筆同指令的時間差在 1 秒內,視為重複,
+/// 只保留一份(避免輪詢執行緒剛好也在同一刻寫入,報告裡出現看似重複的數字)。
+fn collect_diagnostics_history(cfg: &Config) -> Vec<DiagnosticSample> {
+    let mut history = diagnostics::read_recent(cfg);
+    let immediate = diagnostics::run_all(cfg);
+
+    for sample in immediate {
+        let is_duplicate = history.iter().any(|h| {
+            h.command == sample.command && (h.ts_ms - sample.ts_ms).abs() < 1000
+        });
+        if !is_duplicate {
+            history.push(sample);
+        }
+    }
+
+    history.sort_by_key(|s| s.ts_ms);
+    history
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -32,6 +54,10 @@ impl Store {
     /// 寫入 JSON,再呼叫 Python(以 uv 管理)進行根因分析,產生 Markdown 報告。
     pub fn record(&self, mut incident: Incident, cfg: &Config) -> Result<PathBuf> {
         eprintln!("[artemis] 偵測到事件:{} ({})", incident.id, incident.message);
+
+        if cfg.diagnostics.enabled && !cfg.diagnostics.commands.is_empty() {
+            incident.diagnostics_history = collect_diagnostics_history(cfg);
+        }
 
         if cfg.escalation.enabled {
             match agent_client::escalate(&incident, cfg) {

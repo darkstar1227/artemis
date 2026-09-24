@@ -53,6 +53,19 @@ cpu_percent = 95.0
 memory_percent = 95.0
 disk_percent = 90.0
 
+# 事故前歷史診斷數值:不用 Grafana/Prometheus,直接每 30 秒跑一次唯讀指令,
+# 存最近 10 分鐘,事故發生時整段附進報告,讓人第一眼看到 GPU VRAM/記憶體是
+# 「緩慢升高後爆掉」還是「瞬間跳崩」,不用等 AI 解讀或事後才想到要留證據。
+[diagnostics]
+enabled = true
+poll_interval_ms = 30000
+retention_mins = 10
+commands = [
+    "docker stats --no-stream comfyui minimax-h3-fl2va",
+    "nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv",
+    "free -m",
+]
+
 [escalation]
 enabled = true
 verify_window_ms = 15000

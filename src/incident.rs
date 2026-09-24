@@ -31,6 +31,19 @@ pub struct Incident {
     pub restart_count: u32,
     #[serde(default)]
     pub escalation: Option<EscalationReport>,
+    /// 事故前(以及當下補跑一次)的診斷數值歷史,見 config.rs 的
+    /// DiagnosticsConfig。舊事件 JSON 沒有這個欄位時預設為空陣列。
+    #[serde(default)]
+    pub diagnostics_history: Vec<DiagnosticSample>,
+}
+
+/// 單一診斷指令在某個時間點的執行結果(唯讀,例如 `docker stats`/`free -m`)。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DiagnosticSample {
+    pub ts_ms: i64,
+    pub command: String,
+    pub output: String,
+    pub exit_code: i32,
 }
 
 /// 單一 AI 處置階段的結果(呼叫 Claude Code CLI headless 後解析出的結構化決策)。

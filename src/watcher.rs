@@ -89,6 +89,7 @@ fn record_log_incident(
         restarted: false,
         restart_count: 0,
         escalation: None,
+        diagnostics_history: Vec::new(),
     };
     if let Err(e) = store.record(incident, cfg) {
         eprintln!("[artemis] 記錄事件失敗:{e}");

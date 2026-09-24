@@ -41,6 +41,8 @@ pub struct Config {
     pub agents: AgentsConfig,
     #[serde(default)]
     pub remote: RemoteConfig,
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -67,6 +69,42 @@ fn default_mem_threshold() -> f32 {
 }
 fn default_disk_threshold() -> f32 {
     90.0
+}
+
+/// 事故前歷史診斷數值(選用,不需要 Grafana/Prometheus)。啟用後,獨立輪詢
+/// 執行緒每隔 poll_interval_ms 跑一次 commands(唯讀指令,例如 `docker
+/// stats`/`nvidia-smi`/`free -m`),把「時間戳+指令+輸出」寫進一個 rolling
+/// buffer 檔案,只保留最近 retention_mins 分鐘。事件觸發時,Store::record
+/// 會把這段事故前的歷史數值附進 Incident,讓人在報告裡直接看到惡化過程的
+/// 原始數字,不需要另外查儀表板或事後才想到要留證據。
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiagnosticsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default = "default_diagnostics_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_diagnostics_retention_mins")]
+    pub retention_mins: u64,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            commands: Vec::new(),
+            poll_interval_ms: default_diagnostics_poll_interval_ms(),
+            retention_mins: default_diagnostics_retention_mins(),
+        }
+    }
+}
+
+fn default_diagnostics_poll_interval_ms() -> u64 {
+    30_000
+}
+fn default_diagnostics_retention_mins() -> u64 {
+    10
 }
 
 /// AI 分級自主處置設定:偵測到事件後,交由 agent_service(OpenAI Agents SDK

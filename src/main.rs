@@ -2,6 +2,7 @@ mod agent_client;
 mod ai;
 mod central_client;
 mod config;
+mod diagnostics;
 mod incident;
 mod matcher;
 mod onboard;
@@ -109,6 +110,13 @@ fn cmd_watch(path: &PathBuf) -> Result<()> {
     std::thread::spawn(move || {
         if let Err(e) = resource::watch_resources(resource_cfg, resource_store) {
             eprintln!("[artemis] 系統資源監看執行緒結束:{e}");
+        }
+    });
+
+    let diagnostics_cfg = cfg.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = diagnostics::watch_diagnostics(diagnostics_cfg) {
+            eprintln!("[artemis] 診斷數值記錄執行緒結束:{e}");
         }
     });
 

@@ -49,6 +49,19 @@ cpu_percent = 95.0
 memory_percent = 95.0
 disk_percent = 90.0
 
+# 事故前歷史診斷數值:不用 Grafana/Prometheus,直接每 30 秒跑一次唯讀指令,
+# 存最近 10 分鐘,事故發生時整段附進報告,方便直接看 labmonitor_sync
+# 容器資源/健康狀態在壞掉前的變化,不用等 AI 解讀或事後才想到要留證據。
+[diagnostics]
+enabled = true
+poll_interval_ms = 30000
+retention_mins = 10
+commands = [
+    "docker stats --no-stream labmonitor_sync",
+    "docker inspect --format '{{json .State.Health}}' labmonitor_sync",
+    "free -m",
+]
+
 [escalation]
 enabled = true
 verify_window_ms = 30000
