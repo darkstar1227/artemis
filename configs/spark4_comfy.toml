@@ -1,0 +1,97 @@
+# spark4-comfy 上的 ComfyUI + minimax vLLM，兩者都由
+# /home/comfy/comfyh3/docker-compose.yml 管理(comfyui: restart:
+# unless-stopped，沒有內建 HEALTHCHECK，只能透過 auth-proxy 存取；
+# minimax-h3: restart: unless-stopped，內建 healthcheck 打
+# http://127.0.0.1:8000/health，但這個 healthcheck 對「引擎已經 CUDA
+# illegal memory access 掛掉但仍回 200」這種情況是抓不到的)。
+# 兩個服務合成同一個 artemis 專案來監控:command 用 `docker compose logs -f`
+# 同時 tail 兩個 service 的輸出，出事時再由 error_patterns 判斷是哪一個。
+#
+# ⚠️ minimax-h3 的重要教訓(見 docker-compose.yml 註解):曾經有一版用 GPU
+# 使用率之類的黑箱 heuristic 判斷「卡住了」去自動重啟，結果誤殺一個已經跑
+# 3 小時、跑到第 2/59 步的正式生成任務。所以這裡 stage1 只在 log 出現明確
+# 的引擎崩潰訊號(CUDA error / illegal memory access / Traceback)時才允許
+# 重啟 minimax-h3，不用資源使用率之類的間接推測。
+
+name = "spark4-comfy"
+# `docker compose logs` 需要 compose plugin,容器內只有 docker CLI(client),
+# 所以改用純 `docker logs -f` 同時 tail 兩個 container,背景執行後用 wait
+# 讓 sh 一直存活、把兩邊輸出都轉給 artemis 的 supervisor。
+command = "docker logs -f --tail 0 comfyui & docker logs -f --tail 0 minimax-h3-fl2va & wait"
+cwd = "/home/comfy/comfyh3"
+
+log_files = []
+error_patterns = [
+    "Error:",
+    "ERROR",
+    "Uncaught",
+    "UnhandledPromiseRejection",
+    "FATAL",
+    "panic:",
+    "Traceback \\(most recent call last\\)",
+    "CUDA out of memory",
+    "CUDA error",
+    "illegal memory access",
+]
+
+auto_restart = true
+restart_delay_ms = 2000
+max_restarts = 5
+
+incidents_dir = "./incidents/spark4-comfy"
+context_lines = 6
+analyzer_script = "./analyzer/analyze.py"
+
+[resources]
+enabled = true
+poll_interval_ms = 5000
+cpu_percent = 95.0
+memory_percent = 95.0
+disk_percent = 90.0
+
+[escalation]
+enabled = true
+verify_window_ms = 15000
+# 兩個服務健康狀況都要過才算 resolved:comfyui 走 /system_stats,
+# minimax-h3 走它自己的 /health(見上方註解,這個 check 本身有已知盲點)。
+health_check_command = "docker exec comfyui curl -sf -o /dev/null http://localhost:8188/system_stats && docker exec minimax-h3-fl2va curl -sf -o /dev/null http://127.0.0.1:8000/health"
+
+stage1_allowed_tools = [
+    "Bash(docker restart comfyui)",
+    "Bash(docker restart minimax-h3-fl2va)",
+    "Bash(docker logs --tail 200 comfyui)",
+    "Bash(docker logs --tail 200 minimax-h3-fl2va)",
+]
+
+stage3_config_files = []
+
+execution_model = "claude-proxy-sonnet"
+execution_base_url = "https://sg.cancerfree.io/v1"
+execution_api_key_env = "LITELLM_API_KEY"
+
+[agent_service]
+url = "http://192.168.37.161:8787"
+token_env = "ARTEMIS_AGENT_SERVICE_TOKEN"
+timeout_secs = 600
+
+[orchestrator]
+enabled = false
+base_url = "https://sg.cancerfree.io/v1"
+api_key_env = "LITELLM_API_KEY"
+model = "claude-proxy-sonnet"
+timeout_secs = 60
+
+[agents.risk_analysis]
+model = "claude-proxy-sonnet"
+
+[agents.security_analysis]
+model = "claude-proxy-sonnet"
+
+[agents.quick_fix_analysis]
+model = "claude-proxy-sonnet"
+
+[agents.log_analysis]
+model = "claude-proxy-sonnet"
+
+[agents.root_cause_analysis]
+model = "claude-proxy-sonnet"

@@ -1,0 +1,90 @@
+# pi5(cf-pi5-admin, labmonitor 專案的主理部署節點)上的 labmonitor_sync
+# 容器:/home/pi5-01-admin/labmonitor/labmonitors/docker-compose.pi.yml,
+# 這是一個 sync service(.venv/bin/python -m sync_service),定期 SSH 到
+# 樹莓派機群(rpi-hosts.json: rpi-lm1/lm2/lm3/lm4/lm6/lm7)拉資料回來,
+# 不是網頁服務,沒有 HTTP health endpoint,健康狀態要看 docker 自己的
+# HEALTHCHECK 結果。
+#
+# 目前已知有一個持續發生的真實事故:rpi-lm7(192.168.37.71)SSH 查詢失敗
+# (exit 255),導致 rpi-collector/device-monitor 這兩個循環一直壞掉,
+# health check 已經連續失敗 2000+ 次。這份 config 讓 artemis 接手偵測與
+# 記錄這類事件;實際能不能自動修復 rpi-lm7 本身(例如遠端重開機)要看
+# stage1 能不能碰到那台樹莓派 —— 目前只設了「重啟 labmonitor_sync 容器」
+# 這個相對安全的動作,還沒有打通直連個別樹莓派的能力(需要另外用
+# SessAnchor/remote_exec 把每台 rpi 註冊成裝置才能做到,是後續工作)。
+
+name = "labmonitor-sync"
+command = "docker logs -f --tail 0 labmonitor_sync"
+cwd = "/home/pi5-01-admin/labmonitor/labmonitors"
+
+log_files = []
+error_patterns = [
+    "Error:",
+    "ERROR",
+    "RuntimeError",
+    "Traceback \\(most recent call last\\)",
+    "SSH 查詢失敗",
+    "unhealthy loops",
+    "FATAL",
+    "panic:",
+]
+
+auto_restart = true
+restart_delay_ms = 2000
+max_restarts = 5
+
+incidents_dir = "./incidents/labmonitor-sync"
+context_lines = 6
+analyzer_script = "./analyzer/analyze.py"
+
+# 這台 pi5 是共用機器(還跑著 dd_cfeip-web / n8n / cloudflared 等不相關的
+# 容器),資源門檻設寬一點,避免跟 labmonitor 無關的負載觸發誤報。
+[resources]
+enabled = true
+poll_interval_ms = 10000
+cpu_percent = 95.0
+memory_percent = 95.0
+disk_percent = 90.0
+
+[escalation]
+enabled = true
+verify_window_ms = 30000
+health_check_command = "[ \"$(docker inspect labmonitor_sync --format '{{.State.Health.Status}}')\" = healthy ]"
+
+stage1_allowed_tools = [
+    "Bash(docker restart labmonitor_sync)",
+    "Bash(docker logs --tail 200 labmonitor_sync)",
+]
+
+stage3_config_files = []
+
+execution_model = "claude-proxy-sonnet"
+execution_base_url = "https://sg.cancerfree.io/v1"
+execution_api_key_env = "LITELLM_API_KEY"
+
+[agent_service]
+url = "http://192.168.37.161:8787"
+token_env = "ARTEMIS_AGENT_SERVICE_TOKEN"
+timeout_secs = 600
+
+[orchestrator]
+enabled = false
+base_url = "https://sg.cancerfree.io/v1"
+api_key_env = "LITELLM_API_KEY"
+model = "claude-proxy-sonnet"
+timeout_secs = 60
+
+[agents.risk_analysis]
+model = "claude-proxy-sonnet"
+
+[agents.security_analysis]
+model = "claude-proxy-sonnet"
+
+[agents.quick_fix_analysis]
+model = "claude-proxy-sonnet"
+
+[agents.log_analysis]
+model = "claude-proxy-sonnet"
+
+[agents.root_cause_analysis]
+model = "claude-proxy-sonnet"

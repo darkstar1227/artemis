@@ -299,3 +299,38 @@ target line when the file is under git, and renders the Markdown report — incl
 walk-through of whichever escalation stages ran. `analyzer/pyproject.toml` has `[tool.uv] package =
 false` since this is a script, not an importable package; add dependencies there if the analyzer
 ever needs them.
+
+---
+
+## 強制：一定要派 Agent（預設，不是選項）
+
+主 session **不准**自己搜碼、自己改碼、自己收工。使用者不應再口頭提醒。
+
+**目的：保持主 session context 乾淨。** 搜尋結果、檔案內容、中間過程一律留在 agent context，主 session 只收整合後結論。能派就派，不要因為「看起來簡單」自己動手。
+
+| 階段 | 必派 | 主 session 只做 |
+|---|---|---|
+| Discovery / 找檔 / 找根因 / 找既有實作 | `Explore` 或 `general-purpose` | 判斷要不要做、整合結論 |
+| 實作 / bug fix / 多檔改動 | `general-purpose`（fork 或新 agent） | 給範圍與驗收條件 |
+| 做完驗證 | `general-purpose`（獨立驗證） | 最終決策 |
+| Commit | 主 session 可自己 `git commit`（此 repo 未定義 tech-writer 等自訂 subagent） | — |
+| 涉及 auth／API route／機密處理（`agent_service` 的 bearer-token 檢查、`src/agent_client.rs`、`[remote]` 執行等） | 派專門 agent 做安全性檢視 | 整合結論 |
+
+**不是例外：** 改動很小、根因已對上、主 session 剛讀過檔、單檔 bug fix。**唯一可自己動手：** typo／單行明顯修正，且回覆須寫為什麼沒派。
+
+---
+
+## Commit Message（Conventional Commits）
+
+```
+{type}({scope}): {簡述}
+```
+
+type：`feat` / `fix` / `docs` / `style` / `refactor` / `test` / `chore`
+
+- 一次 commit 聚焦一件事，避免混合無關改動
+- Commit 前執行 `cargo build`（Rust 側）與 `uv run pylint` / `uv run pytest`（`agent_service/` 側有改動時），確保無錯誤
+
+### Commit 作者標記
+
+每次 commit 訊息末尾依當前 session 的 attribution 指示附上共同作者標記（見 session 系統指示，目前為 Claude 本身的標記，而非 labreport 慣例的人類 email 標記）。
