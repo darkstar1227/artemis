@@ -8,23 +8,56 @@
 # `artemis onboard <repo-path>` first) with:
 #   [agent_service] url = "http://agent_service:8787"
 #   [central]        enabled = true, collector_url = "http://agent_service:8787"
-#   cwd pointed at /project (the mount path below)
+#   cwd pointed at /projects/<name> (the mount path convention below)
 #
-# Set ARTEMIS_AGENT_SERVICE_TOKEN once you're binding agent_service beyond
-# localhost (docker-compose's internal network already isolates it somewhat,
-# but set a token if agent_service's port is published to the host/internet).
+# IMPORTANT: stage1~3 file edits/bash run inside the agent_service container,
+# not the `artemis watch` container — `agent_service` has no mount of its own
+# unless you add one. So a project's `cwd` must be mounted at the SAME
+# in-container path in BOTH the watch service (for the analyzer's read-only
+# source/git-blame lookups) and agent_service (for stage2/3 read/edit/bash).
+# We use /projects/<name> as that shared path below. Adding a new monitored
+# project = add a matching volume line to both agent_service AND its
+# watch_<name> service, then set cwd = "/projects/<name>" in that project's
+# config. agent_service's mount is read-write (stage2/3 edit files there);
+# the watch container's mount may stay :ro since analyzer/store.rs only
+# reads the project tree (source context + `git blame`, never writes it).
+#
+# ARTEMIS_ALLOWED_CWD_ROOTS below whitelists which cwd values agent_service's
+# EscalateRequest validator (agent_service/schemas.py) will accept, on top of
+# its existing "must exist / must be absolute / must be a real directory"
+# checks. It's set to "/projects:/app" — /app is included because some
+# existing configs (configs/labmonitor_pi5.toml, configs/spark4_comfy.toml)
+# use cwd = "/app" for projects whose `command` only drives a docker
+# container by name/socket and never touches project files, so /app (this
+# image's own WORKDIR, always present) is a valid confinement root for them.
+# Drop "/app" from this list if you don't use that pattern.
+#
+# agent_service is NOT published to the host by default: the artemis
+# containers below reach it over the compose network at
+# http://agent_service:8787, and /escalate lets whoever can reach it run
+# arbitrary bash + file writes against the mounted project(s). ARTEMIS_AGENT_SERVICE_TOKEN
+# is required (compose fails fast if it's unset) so even the internal network
+# can't call /escalate without it. If you do need to reach agent_service from
+# the host (e.g. to curl /health or /incidents while debugging), uncomment
+# the `ports` line below — bind it to 127.0.0.1 only, never "8787:8787",
+# which would expose it on every interface.
 
 services:
   agent_service:
     build: ./agent_service
-    ports:
-      - "8787:8787"
+    # ports:
+    #   - "127.0.0.1:8787:8787"  # host-only debugging access; keep commented otherwise
     environment:
-      - ARTEMIS_AGENT_SERVICE_TOKEN=${ARTEMIS_AGENT_SERVICE_TOKEN:-}
+      - ARTEMIS_AGENT_SERVICE_TOKEN=${ARTEMIS_AGENT_SERVICE_TOKEN:?set ARTEMIS_AGENT_SERVICE_TOKEN before starting (required, /escalate runs arbitrary bash/file writes)}
+      - ARTEMIS_ALLOWED_CWD_ROOTS=/projects:/app
     volumes:
       - agent_service_data:/app/data
+      # One line like this per monitored project, matching the mount below.
+      - /path/to/example-project:/projects/example_project
 
   # One block like this per monitored project. Duplicate + rename for more.
+  # cwd in configs/example_project.toml must be "/projects/example_project"
+  # (same in-container path as agent_service's mount above).
   watch_example_project:
     build: .
     depends_on:
@@ -32,7 +65,7 @@ services:
     volumes:
       - ./configs/example_project.toml:/app/artemis.toml:ro
       - ./incidents/example_project:/app/incidents
-      - /path/to/example-project:/project:ro
+      - /path/to/example-project:/projects/example_project:ro
     command: ["watch", "--config", "/app/artemis.toml"]
 
 volumes:

@@ -311,7 +311,19 @@ compose file — `artemis watch` containers reach it over the compose network at
 `http://agent_service:8787`; `ARTEMIS_AGENT_SERVICE_TOKEN` is a required env var there (compose
 fails fast if unset) since an unauthenticated `/escalate` is remote code execution against the
 mounted project. If you need host access for debugging, uncomment the `ports` line and bind it to
-`127.0.0.1` only, never publish it on `0.0.0.0`.
+`127.0.0.1` only, never publish it on `0.0.0.0`. Stage1~3 execution happens inside the
+`agent_service` container, not `artemis watch`, so each project's directory must be mounted at the
+*same* in-container path (`/projects/<name>` by convention) in **both** services — `agent_service`
+read-write (stage2/3 edit files there), `artemis watch` may stay `:ro` since the analyzer only reads
+source for context/`git blame`. A project's `cwd` in its `configs/<name>.toml` must equal that
+shared in-container path. `ARTEMIS_ALLOWED_CWD_ROOTS` on `agent_service` whitelists which `cwd`
+roots `EscalateRequest` will accept (`agent_service/schemas.py`); the example sets it to
+`/projects:/app` — `/app` stays included because `configs/labmonitor_pi5.toml` and
+`configs/spark4_comfy.toml` use `cwd = "/app"` for projects whose `command` only drives a Docker
+container by name and never touches project files. `agent_service/Dockerfile` installs `git` and
+sets `safe.directory '*'` — stage3 shells out to `git diff` directly in `cwd` to capture the code
+diff, and a host-owned mounted repo would otherwise trip git's dubious-ownership check under the
+container's root user.
 
 ### Python analyzer (analyzer/analyze.py)
 
