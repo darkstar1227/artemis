@@ -15,7 +15,10 @@
 
 name = "labmonitor-sync"
 command = "docker logs -f --tail 0 labmonitor_sync"
-cwd = "/home/pi5-01-admin/labmonitor/labmonitors"
+cwd = "/app"
+# 同 spark4_comfy.toml 的教訓:這個 config 掛進 artemis 容器內跑,容器裡
+# 沒有 host 上的 /home/pi5-01-admin/... 路徑,command 只操作 docker
+# container name/socket,不依賴 cwd,所以用容器內一定存在的 /app。
 
 log_files = []
 error_patterns = [

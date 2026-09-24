@@ -18,7 +18,11 @@ name = "spark4-comfy"
 # 所以改用純 `docker logs -f` 同時 tail 兩個 container,背景執行後用 wait
 # 讓 sh 一直存活、把兩邊輸出都轉給 artemis 的 supervisor。
 command = "docker logs -f --tail 0 comfyui & docker logs -f --tail 0 minimax-h3-fl2va & wait"
-cwd = "/home/comfy/comfyh3"
+cwd = "/app"
+# 上面原本寫 /home/comfy/comfyh3(host 路徑),但這個 config 是掛進
+# artemis 容器內跑的,容器裡沒有這個目錄,導致每次都以 os error 2
+# 啟動失敗。command 只操作 docker container name/socket,不依賴 cwd
+# 底下的檔案,所以直接用容器內一定存在的 /app。
 
 log_files = []
 error_patterns = [
