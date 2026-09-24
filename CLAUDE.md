@@ -330,13 +330,17 @@ ever needs them.
 
 **目的：保持主 session context 乾淨。** 搜尋結果、檔案內容、中間過程一律留在 agent context，主 session 只收整合後結論。能派就派，不要因為「看起來簡單」自己動手。
 
-| 階段 | 必派 | 主 session 只做 |
-|---|---|---|
-| Discovery / 找檔 / 找根因 / 找既有實作 | `Explore` 或 `general-purpose` | 判斷要不要做、整合結論 |
-| 實作 / bug fix / 多檔改動 | `general-purpose`（fork 或新 agent） | 給範圍與驗收條件 |
-| 做完驗證 | `general-purpose`（獨立驗證） | 最終決策 |
-| Commit | 主 session 可自己 `git commit`（此 repo 未定義 tech-writer 等自訂 subagent） | — |
-| 涉及 auth／API route／機密處理（`agent_service` 的 bearer-token 檢查、`src/agent_client.rs`、`[remote]` 執行等） | 派專門 agent 做安全性檢視 | 整合結論 |
+| 階段 | 必派（`.claude/agents/`） | model | 主 session 只做 |
+|---|---|---|---|
+| Discovery / 找檔 / 找根因 / 找既有實作 | `explorer` | claude-proxy-sonnet | 判斷要不要做、整合結論 |
+| 跨檔／里程碑級設計（事件去重、非同步佇列、權限模型重做等） | `planner`（唯讀） | opus | 選方案、拆任務 |
+| 實作 / bug fix / 多檔改動 | `executor` | claude-proxy-sonnet | 給範圍與驗收條件 |
+| 做完驗證 | `verifier`（獨立、跨模型） | claude-proxy-gpt-5.6-terra | 最終決策 |
+| 涉及 auth／API route／機密處理（`agent_service` 的 bearer-token 檢查、`src/agent_client.rs`、`[remote]` 執行、path confinement 等） | `security-review`（唯讀） | claude-proxy-gpt-5.6-terra | 整合結論 |
+| 多個 agent 結果整合 | `summarizer` | claude-proxy-gemini-pro | 最終決策 |
+| 文件 / CHANGELOG / Commit | `tech-writer`（唯一負責 `git commit` 的角色） | claude-proxy-gemini-3.6-flash-high | — |
+
+內建 agent（`general-purpose`/`Explore`）只在專案 agent 尚未載入時當 fallback，且一律指定 `model: "sonnet"`，不可繼承主 session 的 Opus。
 
 **不是例外：** 改動很小、根因已對上、主 session 剛讀過檔、單檔 bug fix。**唯一可自己動手：** typo／單行明顯修正，且回覆須寫為什麼沒派。
 
