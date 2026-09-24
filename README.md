@@ -21,7 +21,7 @@ Not a fixed-rule restart tool, but an agent harness that can judge for itself "w
 │   Rust detection/        │ ──────────────────────────▶ │  agent_service (Python)   │
 │   monitoring layer        │   POST /escalate            │  OpenAI Agents SDK        │
 │   supervisor/watcher/     │ ◀────────────────────────── │  Stage 0~3 judgment +     │
-│   resource → Store        │        EscalationReport      │  execution                │
+│   resource → Recorder     │        EscalationReport      │  execution                │
 └─────────────────────────┘                             └──────────────────────────┘
             │
             ▼
@@ -66,7 +66,7 @@ A single `artemis watch` process only monitors one `artemis.toml` (= one project
 
 1. For each project, first use `artemis onboard <repo-path>` to generate its own `configs/<name>.toml` (which is a tailored monitoring/remediation setting for that project, i.e., an independent agent team).
 2. All projects share the **same** `agent_service` (it is stateless by nature; judgment/execution logic depends entirely on request content).
-3. To query incidents from all hosts and projects in one place, add `[central]` (`enabled = true`, pointing to the same `agent_service`) in each project's configuration — each time `Store::record` records an incident, it also pushes a copy over, regardless of whether that project has `escalation` enabled, and push failures never affect local recording. Query methods: `GET /incidents?host_id=&project=`, `GET /incidents/{host_id}/{incident_id}`.
+3. To query incidents from all hosts and projects in one place, add `[central]` (`enabled = true`, pointing to the same `agent_service`) in each project's configuration — each time an incident is recorded, it also pushes a copy over, regardless of whether that project has `escalation` enabled, and push failures never affect local recording. Query methods: `GET /incidents?host_id=&project=`, `GET /incidents/{host_id}/{incident_id}`.
 
 Docker: `Dockerfile` (repo root) builds the `artemis` monitoring binary; `agent_service/Dockerfile` builds the judgment/execution/synthesis service. `docker-compose.example.yml` demonstrates a shared `agent_service` + one `artemis watch` container per project:
 

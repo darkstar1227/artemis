@@ -42,9 +42,15 @@ cd agent_service && uv run uvicorn main:app --port 8787
 uv run --project analyzer analyzer/analyze.py incidents/<id>.json --project-root . --context-lines 6
 ```
 
-There is no Rust test suite yet; validate `src/` changes by running `cargo build` and doing a manual
-`watch` smoke test against a small script that crashes/prints an error pattern. CI (`.github/
-workflows/rust.yml`) runs `cargo build`/`cargo test` on every push/PR.
+`cargo test` has unit tests for the pure/deterministic pieces — `fingerprint.rs` (FNV-1a vectors,
+template normalization), `incident.rs` (old-shape JSON still deserializes with sane defaults,
+round-trip through serde_json), `config.rs`, `dedup.rs` (the dedup/cooldown/storm-guard decision
+table, driven by a fake clock), and `recorder.rs` (the intake thread's threading/queueing behavior —
+dedup-to-one-escalation, `submit()` never blocking even when the escalator is stuck, overflow counts
+surviving a full queue, pending-escalation caps, `EscalationDone` transitioning status). Beyond that,
+validate `src/` changes with `cargo build` and a manual `watch` smoke test against a small script
+that crashes/prints an error pattern. CI (`.github/workflows/rust.yml`) runs `cargo build`/`cargo
+test` on every push/PR.
 
 `agent_service/` has a minimal smoke-test suite (`agent_service/tests/`) that spins up a fake
 OpenAI-compatible `/chat/completions` server and drives the real `pipeline.escalate()` through it —
@@ -80,7 +86,7 @@ by pointing `execution_base_url`/`orchestrator.base_url` at a port nothing is li
 ### Detection sources (src/supervisor.rs, src/watcher.rs, src/resource.rs)
 
 Three independent producers of `Incident` records, each running on its own thread, all funneling
-into `Store::record`:
+into `Recorder::submit` (see below) — none of them block waiting on dedup, escalation, or disk I/O:
 
 - **supervisor.rs** — spawns `cfg.command` as a child process, tails its stdout/stderr live via
   `LiveScanner` (src/matcher.rs), and handles crash/restart with backoff (`auto_restart`,
@@ -94,24 +100,110 @@ an event; subsequent lines are consumed as stack frames as long as they match th
 (`at fn (file:line:col)`) or Python (`File "...", line N, in fn`) frame formats; the first
 non-frame line closes the event.
 
-### Recording and the escalation pipeline (src/store.rs, src/agent_client.rs, agent_service/)
+### Recording: async intake + dedup + escalation worker (src/recorder.rs, src/dedup.rs, src/fingerprint.rs)
 
-`Store::record(incident, cfg)` is the single choke point every incident source calls. It:
+`Store::record` no longer exists. `Store` is now just `write_json`/`render_markdown`/`list`/`show` —
+plain I/O primitives. The choke point every incident source calls is `Recorder::submit(incident)`,
+which **never blocks**: it's a `try_send` onto a bounded `std::sync::mpsc::sync_channel` (capacity
+`incidents.max_queue`), and a full queue just increments an in-memory overflow counter per
+fingerprint rather than dropping the incident's *count* on the floor (see below).
 
-1. If `escalation.enabled`, calls `agent_client::escalate()`, which POSTs the incident plus the
-   relevant slice of config (`[escalation]`, `[agent_service]`, `[orchestrator]`, `[agents.*]`) to
-   `agent_service`'s `/escalate` endpoint over local HTTP, and attaches the resulting
-   `EscalationReport` to the incident *before* serializing it. Rust stays the single source of truth
-   for `artemis.toml` — every call is stateless on the Python side, config is forwarded per-request
-   rather than duplicated into a second config file.
-2. Writes `incidents/<id>.json`.
-3. Shells out to `uv run --project <dir of analyzer_script> <analyzer_script> <json> --project-root
-   <cfg.cwd> --context-lines <cfg.context_lines>` to render `incidents/<id>.md`. Analyzer failures
-   are logged but never lose the raw JSON.
+Threading (see the module doc at the top of `recorder.rs` for the full picture):
+
+- **Intake thread** (spawned by `Recorder::with_deps`/`Recorder::new`) is the *only* thread that
+  writes to `incidents/`. It polls the Detected channel (`recv_timeout(100ms)`), drains any
+  `EscalationDone` results (`try_recv`, unbounded channel from the worker), and once a real-time
+  second has elapsed since the last one, runs a "Tick" (`handle_tick`): flattens accumulated
+  overflow counts into the fingerprint's current incident, throttled-rewrites any incident whose
+  count/`last_seen` changed since `rewrite_interval_secs` ago, and resolves fingerprints that have
+  gone quiet past `resolve_after_secs`.
+- **Escalation worker thread** receives `EscalationJob`s over an unbounded channel and calls
+  `Escalator::escalate()` (production: `agent_client::escalate`) — the *only* place in the whole
+  pipeline that can actually block for a long time, and it never blocks the intake thread or the
+  detection threads that called `submit()`.
+- The intake thread tracks its own `pending: HashSet<id>` of in-flight escalations and refuses to
+  send a new job once `max_pending_escalations` is reached (marking that incident `Suppressed` with
+  `status_reason = "queue_full"`) — this is deliberately *not* derived from the job channel's
+  buffered length, since a job the worker has already `recv()`'d off the channel is still logically
+  pending even though the channel itself reports empty (see the recorder.rs module doc for why a
+  channel-capacity-based check would race at `max_pending_escalations == 1`).
+
+**Fingerprinting** (`src/fingerprint.rs`): every incident gets a 16-hex-digit FNV-1a-64 fingerprint
+computed from `source_key|normalized_template|top_frame`, where `source_key` is `"process"` or
+`"log:<path>"`, `top_frame` is `basename(file)::function` of the first stack frame, and
+`normalize_template()` regex-replaces UUIDs, ISO/syslog timestamps, hex runs, file paths, and
+remaining digit runs with placeholders (`<uuid>`/`<ts>`/`<hex>`/`<path>`/`<n>`) so the same class of
+error at a different line number/pid/timestamp still hashes the same. Hand-rolled FNV-1a rather than
+`DefaultHasher` because the fingerprint is persisted to disk and compared across process restarts —
+`DefaultHasher`'s algorithm/seed isn't guaranteed stable across Rust versions.
+
+**Dedup/cooldown/storm rules** (`src/dedup.rs::Deduper::decide`, pure logic, no I/O, time passed in
+as a parameter): given a fingerprint and `now`, returns one of:
+- `NewEscalate` / `NewSuppressed("storm")` — brand-new fingerprint; suppressed only if the global
+  storm guard (a sliding one-hour window, `max_escalations_per_hour`, shared across *all*
+  fingerprints, `0` = unlimited) is out of capacity.
+- `Append { id }` — same fingerprint seen again inside `dedup_window_secs` of an entry that's neither
+  Mitigated nor Resolved (or *any* entry still Open/Escalating even outside the window, since it was
+  never properly handled) — just bump `occurrence_count`/`last_seen` on the existing incident, no new
+  escalation.
+- `Recurrence { prev, escalate, reason }` — the fingerprint's representative incident was previously
+  Mitigated or Resolved (Resolved counts even *inside* the dedup window, since it was already
+  declared fixed once): a new `Incident` is created with `recurrence_of = Some(prev)`; `escalate` is
+  true only if `cooldown_secs` has elapsed since the last actual escalation *and* the storm guard has
+  capacity, otherwise `reason` is `"cooldown"` or `"storm"` and the new incident is `Suppressed`
+  (subsequent occurrences just `Append` onto that suppressed incident until cooldown/storm clears).
+- A `Suppressed` representative is re-evaluated on every fresh `decide()` call regardless of window,
+  so a fingerprint doesn't stay suppressed forever after the condition that suppressed it clears.
+
+**Status lifecycle** (`IncidentStatus`: `Open → Escalating → Mitigated | Resolved`, or `Suppressed`
+at any point instead of `Escalating`): set by `recorder.rs`'s `record_escalate_path`/
+`record_suppressed_path`/`handle_escalation_done`/`handle_tick`. `escalation.enabled = false` skips
+straight to `Open` without ever going through `Escalating`. `EscalationDone` maps
+`final_resolved: true → Mitigated`, `false → Open`, and an `Err` from the escalator → `Open` with
+`status_reason = "escalation_failed"`. A tick resolves anything Open/Mitigated/Suppressed idle past
+`resolve_after_secs` to `Resolved` with `status_reason = "no_recurrence"` (oldest first, at most
+`MAX_RESOLVES_PER_TICK` = 16 per tick since each one re-renders Markdown on the intake thread; the
+rest carry over to the next tick).
+
+**Startup rebuild** (`recorder.rs::rebuild_state`, runs once before the intake loop processes any
+Detected event): scans `incidents_dir` for this project's `.json` files newer than
+`max(dedup_window_secs, cooldown_secs, resolve_after_secs)` measured by liveness, not creation time
+(file mtime checked first, cheaply — every append flush rewrites the JSON — then `last_seen` after
+parsing; a long-lived incident created hours ago but still recurring is kept), reconstructs `Deduper` entries (one representative per fingerprint —
+the one with the latest `last_seen`) and the storm guard's sliding window, and marks any incident
+that was left in `Escalating` when the process died as `Open` with `status_reason = "interrupted"` —
+**it does not get re-escalated**, since it was already written to disk with `Escalating` status
+before the job was sent (not lost, just cut off mid-flight).
+
+**Shutdown** (`src/shutdown.rs`, wired up by `cmd_watch`): a shared `AtomicBool` flag, set by a
+SIGTERM/SIGINT handler. First signal: `watcher`/`resource`/`supervisor` loops notice on their next
+poll tick and return, then `cmd_watch` calls `Recorder::shutdown_and_join`, which sends an explicit
+`IntakeEvent::Shutdown` and the intake thread runs `run_shutdown_sequence` — drains any
+still-buffered Detected events, force-flushes (ignoring the rewrite throttle) via `handle_tick`,
+drops the job sender so the worker exits once its current job (if any) finishes, waits up to
+`shutdown_grace_secs` for in-flight `EscalationDone`s to land (each one is persisted as it arrives),
+then force-flushes once more. A **second** SIGTERM/SIGINT ends the process immediately, bypassing the
+grace period (registration order matters here — see the doc comment on `shutdown::install` for a
+subtle handler-ordering bug this fixed). Detection threads must stop calling `submit()` *before*
+`shutdown_and_join` runs, or events submitted after intake starts draining would sit unprocessed in
+the channel forever.
+
+Regardless of any of the above, once an incident is actually escalated:
+
+1. `agent_client::escalate()` POSTs the incident plus the relevant slice of config (`[escalation]`,
+   `[agent_service]`, `[orchestrator]`, `[agents.*]`, `[remote]`) to `agent_service`'s `/escalate`
+   endpoint over local HTTP, and the resulting `EscalationReport` is attached to the incident before
+   it's rewritten to disk. Rust stays the single source of truth for `artemis.toml` — every call is
+   stateless on the Python side, config is forwarded per-request rather than duplicated into a second
+   config file.
+2. The incident is written to `incidents/<id>.json` (via `Sink::write_json`).
+3. Rust shells out to `uv run --project <dir of analyzer_script> <analyzer_script> <json>
+   --project-root <cfg.cwd> --context-lines <cfg.context_lines>` to render `incidents/<id>.md`.
+   Analyzer failures are logged but never lose the raw JSON.
 
 If `agent_service` is unreachable or returns an error, `agent_client::escalate()` returns `Err` and
-`Store::record` logs it and proceeds with `incident.escalation = None` — a down/misconfigured
-agent_service never blocks incident recording.
+the incident is marked `Open`/`"escalation_failed"` — a down/misconfigured agent_service never blocks
+incident recording.
 
 `agent_service` (`agent_service/pipeline.py::escalate()`) runs the full four-stage flow, all via the
 **OpenAI Agents SDK** pointed at whatever OpenAI-compatible endpoint each role's config names
@@ -208,8 +300,15 @@ otherwise produce invalid TOML.
 `artemis.toml` (scaffolded by `artemis init` from `Config::EXAMPLE`) is the single source of truth;
 there are no env-var overrides — API keys for LiteLLM/providers are read from an env var *name*
 configured in TOML (`api_key_env`), never stored in the file itself. Notable nesting: `[resources]`,
-`[escalation]`, `[agent_service]`, `[central]`, `[orchestrator]` and `[agents.*]` are all optional
-tables with their own defaults, so a minimal config only needs `command`. `[agent_service]` (`url`,
+`[escalation]`, `[agent_service]`, `[central]`, `[orchestrator]`, `[incidents]` and `[agents.*]` are
+all optional tables with their own defaults, so a minimal config only needs `command`. `[incidents]`
+(`IncidentsConfig`) governs the dedup/cooldown/queue behavior described in the Recording section
+above: `dedup_window_secs` (default 300, `0` disables dedup), `cooldown_secs` (default 1800),
+`resolve_after_secs` (default 3600, must be ≥ `dedup_window_secs`), `max_escalations_per_hour`
+(default 6, global storm guard, `0` = unlimited), `max_queue` (default 1024, the Detected channel's
+bounded capacity), `max_pending_escalations` (default 8, in-flight escalation cap),
+`rewrite_interval_secs` (default 10, throttles count/`last_seen` rewrites) and
+`shutdown_grace_secs` (default 30, how long shutdown waits for in-flight escalations). `[agent_service]` (`url`,
 `timeout_secs`, optional `token_env`) is where the Python service's HTTP endpoint lives —
 `token_env` names an env var holding a bearer token, only needed if `agent_service` is bound beyond
 `127.0.0.1` (see the agent_service section below). `[central]` (`enabled`, `collector_url`,
@@ -232,6 +331,18 @@ resource.rs). `EscalationReport` holds an optional `multi_agent_analysis: Option
 `Synthesis`, Rust just stores/forwards it) plus up to three `StageResult`s and
 `final_resolved`/`code_diff`.
 
+Lifecycle fields added for dedup/recurrence tracking (all `#[serde(default)]` so old JSON without
+them still deserializes, see `incident.rs`'s `old_format_json_deserializes_with_defaults` test):
+`fingerprint`/`fingerprint_template` (from `fingerprint::compute`, `None` on old JSON never
+backfilled), `occurrence_count` (defaults to 1), `first_seen`/`last_seen` (`Option<DateTime<Utc>>`),
+`status` (`IncidentStatus`: `open` | `escalating` | `mitigated` | `resolved` | `suppressed`, default
+`open`), `status_reason` (free-text, e.g. `"cooldown"`/`"storm"`/`"queue_full"`/`"interrupted"`/
+`"escalation_failed"`/`"no_recurrence"`), `recurrence_of` (the id of the incident this one is a
+recurrence of, if any), and `severity` (`Severity`: `critical` | `high` | `medium` | `low`, default `high`). All
+of these are set through `Incident::detected(...)` — every incident source (supervisor/watcher/
+resource) constructs through this one function rather than a struct literal, so the initialization
+logic lives in exactly one place.
+
 ### agent_service (agent_service/)
 
 Python, `uv`-managed, built on the **OpenAI Agents SDK**. Files:
@@ -253,12 +364,31 @@ Python, `uv`-managed, built on the **OpenAI Agents SDK**. Files:
   `DiagnosticSample` history, src/incident.rs), grouped by command with most-recent-first and capped
   at `INCIDENT_DIAGNOSTICS_MAX_CHARS`, so stage/judgment agents see resource trends leading up to the
   incident, not just the moment it fired. Missing/empty `diagnostics_history` is tolerated (older
-  incidents, or Rust configs with diagnostics disabled).
+  incidents, or Rust configs with diagnostics disabled). It also renders a one/two-line summary of
+  the Rust-side lifecycle fields when present — `occurrence_count` (with `first_seen`/`last_seen`),
+  `severity`, `recurrence_of` — so stage/judgment agents know up front whether they're looking at a
+  first occurrence or a recurring/high-frequency error; absent on old-shape incidents, tolerated the
+  same way as `diagnostics_history`.
 - `main.py` — the FastAPI app (`GET /health`, `POST /escalate`).
 - `tests/` — mock-LLM smoke tests (see Commands above); not part of the shipped service.
 
 Run it with `cd agent_service && uv run uvicorn main:app --port 8787`. It's stateless — no local
 config file, no persisted state — everything it needs arrives in the request body.
+
+**Per-cwd serialization + idempotency** (`main.py`): stage2/stage3 write files and shell out to `git
+diff` directly against `cwd`, so two concurrent `/escalate` calls for the same project would step on
+each other — `main.py` keeps one `asyncio.Lock` per resolved `cwd` (`_cwd_locks`) and runs the actual
+`escalate(req)` call inside it; different projects' cwds run fully in parallel. Separately, Rust's
+`ureq` HTTP client retrying/timing out and resending the same incident is expected (a stage3 run can
+legitimately take longer than a short client timeout), so `main.py` also keeps an in-memory
+`(resolved_cwd, incident_id) → Task` cache (`_idempotency_cache`, bounded LRU + 1-hour TTL): a
+resend for a key already in flight or already finished awaits/returns the *same* `EscalationReport`
+instead of re-running the pipeline (which could otherwise, say, re-run stage3's file edits). A
+replay response carries `X-Artemis-Idempotent-Replay: true`. Both the lock and the cache are
+in-memory only — they reset if `agent_service` restarts, and don't survive across multiple
+`agent_service` replicas. Note that Rust's configured `ureq` timeout includes any time spent queued
+behind another in-flight escalation for the same cwd (waiting on the lock), not just the escalation's
+own execution time.
 
 **Access control**: `/escalate` executes arbitrary bash and file writes against `cfg.cwd` on
 whatever the request tells it to — safe by default only because the default bind address is
@@ -291,13 +421,18 @@ projects/hosts: `artemis onboard <repo>` per project gives each one its own tail
 `configs/<name>.toml`; all of them can point `[agent_service]` at the *same* `agent_service`
 instance since it's stateless per-request. For a single place to query incidents across every
 host/project, set `[central] enabled = true` (+ `collector_url`, `host_id`, optional `token_env`)
-— `Store::record` best-effort-pushes every recorded incident (JSON + rendered Markdown) to
-`agent_service`'s `POST /incidents`, **independent of whether `escalation.enabled`** on that host; a
-push failure only logs, never affects local recording (`central_client::push`, same
-fire-and-forget philosophy as `agent_client::escalate`). `agent_service/central.py` persists pushes
+— `RealSink::push_central` (called by the intake thread after every write) best-effort-pushes every
+recorded incident (JSON + rendered Markdown) to `agent_service`'s `POST /incidents`, **independent of
+whether `escalation.enabled`** on that host; a push failure only logs, never affects local recording
+(`central_client::push`, same fire-and-forget philosophy as `agent_client::escalate`).
+`agent_service/central.py` persists pushes
 to a local SQLite file (`agent_service/data/central.db`, stdlib `sqlite3`, no new dependency) and
 `main.py` exposes `GET /incidents?host_id=&project=&limit=` and `GET
 /incidents/{host_id}/{incident_id}` (both behind the same bearer-token auth as `/escalate`).
+`IncidentSummary`'s lifecycle fields (`status`, `severity`, `occurrence_count`, `last_seen`,
+`fingerprint`) aren't their own DB columns — `central.py::list_incidents` derives them from the
+stored `incident_json` at read time, so a row pushed by a pre-lifecycle host with none of these
+fields just lists them back as `None` rather than requiring a schema migration.
 
 `Dockerfile` (repo root) builds the `artemis` binary; the runtime image also pre-provisions
 `analyzer`'s pinned Python interpreter and warms its venv at build time (`uv python install 3.14 &&
