@@ -86,8 +86,8 @@ def list_incidents(
     host_id: str | None = None, project: str | None = None, limit: int = 100
 ) -> list[IncidentSummary]:
     query = (
-        "SELECT host_id, project, incident_id, message, timestamp, final_resolved, received_at "
-        "FROM incidents"
+        "SELECT host_id, project, incident_id, message, timestamp, final_resolved, "
+        "received_at, incident_json FROM incidents"
     )
     clauses = []
     params: list[str] = []
@@ -105,18 +105,33 @@ def list_incidents(
     with _conn() as conn:
         rows = conn.execute(query, params).fetchall()
 
-    return [
-        IncidentSummary(
-            host_id=r[0],
-            project=r[1],
-            incident_id=r[2],
-            message=r[3],
-            timestamp=r[4],
-            final_resolved=bool(r[5]) if r[5] is not None else None,
-            received_at=r[6],
+    summaries = []
+    for r in rows:
+        # Milestone 1 lifecycle fields aren't their own DB columns — they're
+        # read back out of the stored incident_json at query time, so rows
+        # pushed by a pre-milestone host (no incident_json fields at all)
+        # just come back as None instead of erroring.
+        try:
+            incident = json.loads(r[7])
+        except (json.JSONDecodeError, TypeError):
+            incident = {}
+        summaries.append(
+            IncidentSummary(
+                host_id=r[0],
+                project=r[1],
+                incident_id=r[2],
+                message=r[3],
+                timestamp=r[4],
+                final_resolved=bool(r[5]) if r[5] is not None else None,
+                received_at=r[6],
+                status=incident.get("status"),
+                severity=incident.get("severity"),
+                occurrence_count=incident.get("occurrence_count"),
+                last_seen=incident.get("last_seen"),
+                fingerprint=incident.get("fingerprint"),
+            )
         )
-        for r in rows
-    ]
+    return summaries
 
 
 def get_incident(host_id: str, incident_id: str) -> dict | None:

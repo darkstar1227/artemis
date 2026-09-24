@@ -96,6 +96,24 @@ def _diagnostics_section(incident: dict) -> str:
     return "\n事故前診斷歷史:\n" + _truncate(section, INCIDENT_DIAGNOSTICS_MAX_CHARS)
 
 
+def _lifecycle_line(incident: dict) -> str:
+    """Milestone 1 的 lifecycle 欄位(src/incident.rs)——occurrence_count/
+    first_seen/last_seen/severity/recurrence_of。舊事件 JSON 沒有這些欄位時
+    整段省略,不影響既有行為。"""
+    occurrence_count = incident.get("occurrence_count")
+    if occurrence_count is None:
+        return ""
+    line = (
+        f"發生次數:{occurrence_count}"
+        f"(首次:{incident.get('first_seen') or '?'},最近一次:{incident.get('last_seen') or '?'})\n"
+    )
+    if incident.get("severity"):
+        line += f"嚴重程度:{incident['severity']}\n"
+    if incident.get("recurrence_of"):
+        line += f"重複發生自:{incident['recurrence_of']}\n"
+    return line
+
+
 def incident_context(incident: dict) -> str:
     frames = incident.get("frames") or []
     frame_lines = "\n".join(f"  - {f.get('raw', '')}" for f in frames[:INCIDENT_FRAMES_MAX])
@@ -106,6 +124,7 @@ def incident_context(incident: dict) -> str:
         f"專案:{incident.get('project')}\n"
         f"來源:{incident.get('source')}\n"
         f"錯誤訊息:{incident.get('message')}\n"
+        f"{_lifecycle_line(incident)}"
         f"堆疊/相關內容:\n{frame_lines}\n"
         f"原始輸出:\n{raw}"
         f"{_diagnostics_section(incident)}"

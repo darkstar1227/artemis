@@ -176,3 +176,12 @@ class IncidentSummary(BaseModel):
     timestamp: str
     final_resolved: Optional[bool] = None
     received_at: str
+    # Milestone 1 lifecycle fields (src/incident.rs) — derived from the stored
+    # incident_json at read time (see central.py::list_incidents), not their
+    # own DB columns, so old rows pushed before this milestone still list
+    # fine with these simply coming back as None.
+    status: Optional[str] = None
+    severity: Optional[str] = None
+    occurrence_count: Optional[int] = None
+    last_seen: Optional[str] = None
+    fingerprint: Optional[str] = None

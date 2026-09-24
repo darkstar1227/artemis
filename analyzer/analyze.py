@@ -191,6 +191,27 @@ def build_report(incident: dict, project_root: Path, context_lines: int) -> str:
     lines.append(f"- 訊息:**{incident.get('message')}**")
     if incident.get("exit_code") is not None:
         lines.append(f"- Exit code:{incident['exit_code']}")
+    if incident.get("severity") is not None:
+        lines.append(f"- 嚴重程度:{incident['severity']}")
+    if incident.get("status") is not None:
+        status_line = f"- 狀態:{incident['status']}"
+        if incident.get("status_reason"):
+            status_line += f"({incident['status_reason']})"
+        lines.append(status_line)
+    if incident.get("occurrence_count") is not None:
+        occ_line = f"- 發生次數:{incident['occurrence_count']}"
+        first_seen = incident.get("first_seen")
+        last_seen = incident.get("last_seen")
+        if first_seen or last_seen:
+            occ_line += f"(首次:{first_seen or '?'},最近一次:{last_seen or '?'})"
+        lines.append(occ_line)
+    if incident.get("fingerprint") is not None:
+        fp_line = f"- 指紋:`{incident['fingerprint']}`"
+        if incident.get("fingerprint_template"):
+            fp_line += f"(template:`{incident['fingerprint_template']}`)"
+        lines.append(fp_line)
+    if incident.get("recurrence_of") is not None:
+        lines.append(f"- 重複發生自:{incident['recurrence_of']}")
     lines.append("")
 
     diagnostics_section = render_diagnostics_history(incident.get("diagnostics_history") or [])
