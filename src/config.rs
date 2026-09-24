@@ -43,6 +43,8 @@ pub struct Config {
     pub remote: RemoteConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    #[serde(default)]
+    pub incidents: IncidentsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -373,6 +375,87 @@ fn default_remote_timeout_secs() -> u64 {
     120
 }
 
+/// 事件去重/冷卻設定(Milestone 1)。目前只描述參數,尚未有程式碼讀取
+/// 這些欄位(dedup.rs 的邏輯還沒接進 Store/recorder,是下一步的工作)——
+/// 這裡先讓設定檔可以帶這個表格並通過驗證,行為不變。
+// Milestone 1 step 4 起 dedup.rs 才會實際讀取這些欄位(Store/recorder 尚未
+// 接上);目前只需要能被解析與驗證,先窄範圍 allow 掉 dead_code 警告。
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct IncidentsConfig {
+    /// 同一指紋在這個秒數內的重複發生視為「同一事件」(只 append,不重新
+    /// 升級處置)。設為 0 表示關閉去重,每次都當新事件。
+    #[serde(default = "default_dedup_window_secs")]
+    pub dedup_window_secs: u64,
+    /// 同一指紋被判定為「事後又發生」(recurrence)時,距離上次升級處置
+    /// 至少要經過這個秒數才會再次升級,否則標記為 suppressed("cooldown")。
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// 事件超過這個秒數沒有再出現,視為已自然解決,可標記為 Resolved。
+    /// 必須 ≥ dedup_window_secs(否則同一事件視窗內就先被判定解決,矛盾)。
+    #[serde(default = "default_resolve_after_secs")]
+    pub resolve_after_secs: u64,
+    /// 全域 storm guard:每小時最多允許幾次升級處置(跨所有指紋共用同一個
+    /// 額度),避免同一時間大量不同錯誤把 agent_service/LLM 打爆。
+    /// 0 表示不限制(storm guard 停用)。
+    #[serde(default = "default_max_escalations_per_hour")]
+    pub max_escalations_per_hour: u32,
+    /// 事件記錄佇列的最大長度(超過時視佇列使用方式而定,可能丟棄最舊或
+    /// 拒絕新事件——由接上這個設定的呼叫端決定)。
+    #[serde(default = "default_max_queue")]
+    pub max_queue: usize,
+    /// 同時等待中的升級處置(呼叫 agent_service)上限,避免單一 host 同時
+    /// 對 agent_service 發起過多平行請求。
+    #[serde(default = "default_max_pending_escalations")]
+    pub max_pending_escalations: usize,
+    /// 指紋/狀態表定期落地(rewrite)到磁碟的間隔秒數。
+    #[serde(default = "default_rewrite_interval_secs")]
+    pub rewrite_interval_secs: u64,
+    /// 行程收到結束訊號時,等待進行中的升級處置完成的最長秒數。
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
+}
+
+impl Default for IncidentsConfig {
+    fn default() -> Self {
+        Self {
+            dedup_window_secs: default_dedup_window_secs(),
+            cooldown_secs: default_cooldown_secs(),
+            resolve_after_secs: default_resolve_after_secs(),
+            max_escalations_per_hour: default_max_escalations_per_hour(),
+            max_queue: default_max_queue(),
+            max_pending_escalations: default_max_pending_escalations(),
+            rewrite_interval_secs: default_rewrite_interval_secs(),
+            shutdown_grace_secs: default_shutdown_grace_secs(),
+        }
+    }
+}
+
+fn default_dedup_window_secs() -> u64 {
+    300
+}
+fn default_cooldown_secs() -> u64 {
+    1800
+}
+fn default_resolve_after_secs() -> u64 {
+    3600
+}
+fn default_max_escalations_per_hour() -> u32 {
+    6
+}
+fn default_max_queue() -> usize {
+    1024
+}
+fn default_max_pending_escalations() -> usize {
+    8
+}
+fn default_rewrite_interval_secs() -> u64 {
+    10
+}
+fn default_shutdown_grace_secs() -> u64 {
+    30
+}
+
 fn default_name() -> String {
     "unnamed-project".into()
 }
@@ -415,7 +498,29 @@ impl Config {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("找不到設定檔:{}\n請先執行 `artemis init`", path.display()))?;
         let cfg: Config = toml::from_str(&raw).context("設定檔格式錯誤 (artemis.toml)")?;
+        cfg.validate().context("設定檔驗證失敗 (artemis.toml)")?;
         Ok(cfg)
+    }
+
+    /// 驗證欄位間的邏輯限制(型別層級已經由 serde/toml 檢查過)。
+    /// 目前只驗證 [incidents];其餘表格暫無跨欄位限制。
+    pub fn validate(&self) -> Result<()> {
+        let inc = &self.incidents;
+        if inc.max_queue < 1 {
+            anyhow::bail!("[incidents] max_queue 必須 >= 1");
+        }
+        if inc.max_pending_escalations < 1 {
+            anyhow::bail!("[incidents] max_pending_escalations 必須 >= 1");
+        }
+        // max_escalations_per_hour = 0 表示「不限制」,是刻意支援的值。
+        if inc.resolve_after_secs < inc.dedup_window_secs {
+            anyhow::bail!(
+                "[incidents] resolve_after_secs ({}) 必須 >= dedup_window_secs ({})",
+                inc.resolve_after_secs,
+                inc.dedup_window_secs
+            );
+        }
+        Ok(())
     }
 
     pub const EXAMPLE: &'static str = r#"# artemis.toml — Agent 版 autoheal 設定檔
@@ -553,5 +658,119 @@ timeout_secs = 120
 allowed_commands = [
     # "Bash(systemctl restart myapp)",
 ]
+
+# 事件去重/冷卻(Milestone 1)。目前這個表格的欄位還沒有程式碼在讀取
+# (dedup.rs 尚未接進 Store/recorder),先讓設定檔可以帶著這些值並通過驗證,
+# 之後接上後行為才會改變。
+[incidents]
+# 同一指紋在這個秒數內再次發生視為「同一事件」,只累加次數不重新升級處置。
+# 設為 0 表示關閉去重,每次都當新事件。
+dedup_window_secs = 300
+# 事件被判定為「重新發生」(recurrence,例如之前已標記 Mitigated/Resolved)
+# 時,距離上次升級處置至少要經過這個秒數才會再次升級,否則視為
+# suppressed("cooldown")。
+cooldown_secs = 1800
+# 超過這個秒數沒有再出現的事件視為已自然解決。必須 >= dedup_window_secs。
+resolve_after_secs = 3600
+# 全域 storm guard:所有指紋共用,每小時最多允許幾次升級處置(呼叫
+# agent_service),避免短時間大量不同錯誤把 LLM/agent_service 打爆。
+# 0 表示不限制。
+max_escalations_per_hour = 6
+# 事件記錄佇列長度上限。
+max_queue = 1024
+# 同時等待中的升級處置(呼叫 agent_service)數量上限,注意 agent_service
+# 的 HTTP timeout(見 [agent_service] timeout_secs)包含排在同一個
+# 專案前面的升級處置的等待時間 —— 佇列愈滿,排在後面的請求愈可能連
+# 排隊時間都算進自己的 timeout 裡而逾時。
+max_pending_escalations = 8
+# 指紋/狀態表定期落地到磁碟的間隔秒數。
+rewrite_interval_secs = 10
+# 收到結束訊號時,等待進行中升級處置完成的最長秒數。
+shutdown_grace_secs = 30
 "#;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incidents_defaults_when_table_absent() {
+        let cfg: Config = toml::from_str(r#"command = "node app.js""#).expect("最小設定應可解析");
+        assert_eq!(cfg.incidents.dedup_window_secs, 300);
+        assert_eq!(cfg.incidents.cooldown_secs, 1800);
+        assert_eq!(cfg.incidents.resolve_after_secs, 3600);
+        assert_eq!(cfg.incidents.max_escalations_per_hour, 6);
+        assert_eq!(cfg.incidents.max_queue, 1024);
+        assert_eq!(cfg.incidents.max_pending_escalations, 8);
+        assert_eq!(cfg.incidents.rewrite_interval_secs, 10);
+        assert_eq!(cfg.incidents.shutdown_grace_secs, 30);
+        cfg.validate().expect("預設值應通過驗證");
+    }
+
+    #[test]
+    fn example_config_parses_and_validates() {
+        let cfg: Config = toml::from_str(Config::EXAMPLE).expect("EXAMPLE 應可解析");
+        cfg.validate().expect("EXAMPLE 應通過驗證");
+    }
+
+    #[test]
+    fn every_repo_config_file_parses_and_validates() {
+        // 掃過 repo 內每一份 configs/*.toml 與根目錄 artemis.toml(若存在),
+        // 確保新增 [incidents] 欄位沒有讓既有設定檔壞掉。
+        let mut checked = 0;
+        for dir in ["configs", "."] {
+            let entries = match fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                if path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml") {
+                    continue;
+                }
+                let raw = fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("讀取 {} 失敗: {e}", path.display()));
+                let cfg: Config = toml::from_str(&raw)
+                    .unwrap_or_else(|e| panic!("{} 應可解析: {e}", path.display()));
+                cfg.validate()
+                    .unwrap_or_else(|e| panic!("{} 應通過驗證: {e}", path.display()));
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "應該至少掃到一份 .toml 設定檔");
+    }
+
+    #[test]
+    fn invalid_max_queue_rejected() {
+        let mut cfg: Config = toml::from_str(r#"command = "node app.js""#).unwrap();
+        cfg.incidents.max_queue = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_max_pending_escalations_rejected() {
+        let mut cfg: Config = toml::from_str(r#"command = "node app.js""#).unwrap();
+        cfg.incidents.max_pending_escalations = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn resolve_after_secs_below_dedup_window_rejected() {
+        let mut cfg: Config = toml::from_str(r#"command = "node app.js""#).unwrap();
+        cfg.incidents.dedup_window_secs = 600;
+        cfg.incidents.resolve_after_secs = 300;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn dedup_window_zero_is_allowed() {
+        let mut cfg: Config = toml::from_str(r#"command = "node app.js""#).unwrap();
+        cfg.incidents.dedup_window_secs = 0;
+        cfg.incidents.resolve_after_secs = 0;
+        assert!(cfg.validate().is_ok());
+    }
 }
