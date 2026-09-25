@@ -25,6 +25,8 @@ pub fn escalate(incident: &Incident, cfg: &Config) -> Result<EscalationReport> {
             "execution_model": cfg.escalation.execution_model,
             "execution_base_url": cfg.escalation.execution_base_url,
             "execution_api_key_env": cfg.escalation.execution_api_key_env,
+            "max_turns_per_stage": cfg.escalation.max_turns_per_stage,
+            "max_tokens_per_escalation": cfg.escalation.max_tokens_per_escalation,
         },
         "orchestrator": {
             "enabled": cfg.orchestrator.enabled,

@@ -132,6 +132,16 @@ pub struct EscalationReport {
     pub stage3_code_fix: Option<StageResult>,
     pub final_resolved: bool,
     pub code_diff: Option<String>,
+
+    /// 這次 escalate() 呼叫(stage0 分析 + stage1~3)累計消耗的 token 數,
+    /// 由 agent_service 依 Agents SDK 回報的 usage 加總。舊事件 JSON 沒有
+    /// 這個欄位時為 None(未曾統計過)。
+    #[serde(default)]
+    pub tokens_used: Option<u64>,
+    /// 是否因為觸及 [escalation] max_tokens_per_escalation 而提早跳過/中止
+    /// 某個階段。舊事件 JSON 沒有這個欄位時預設為 false。
+    #[serde(default)]
+    pub budget_exhausted: bool,
 }
 
 impl Incident {
@@ -224,6 +234,24 @@ mod tests {
         assert_eq!(inc.severity, Severity::High);
         assert!(inc.diagnostics_history.is_empty());
         assert!(inc.escalation.is_none());
+    }
+
+    #[test]
+    fn old_format_escalation_report_json_deserializes_with_defaults() {
+        // 模擬 tokens_used/budget_exhausted 加入之前寫到磁碟的舊 EscalationReport JSON。
+        let old_json = r#"{
+            "stage1_immediate": null,
+            "stage2_parameter": null,
+            "stage3_code_fix": null,
+            "final_resolved": true,
+            "code_diff": null
+        }"#;
+
+        let report: EscalationReport =
+            serde_json::from_str(old_json).expect("舊格式 EscalationReport JSON 應可反序列化");
+        assert_eq!(report.tokens_used, None);
+        assert!(!report.budget_exhausted);
+        assert!(report.final_resolved);
     }
 
     #[test]
