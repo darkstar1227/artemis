@@ -63,6 +63,19 @@ class EscalationSettings(BaseModel):
     execution_model: Optional[str] = None
     execution_base_url: Optional[str] = None
     execution_api_key_env: Optional[str] = None
+    # stage1~3 每一層 Runner.run() 的 max_turns 上限——每一輪都會把完整對話歷史
+    # 重送給模型,調低能壓低 token 成本(見 pipeline.py::run_stage)。
+    max_turns_per_stage: int = 12
+    # 單次 escalate() 呼叫(stage0 分析 + stage1~3)累計可用的 token 預算,
+    # 0 表示不限制(見 pipeline.py::TokenBudget)。
+    max_tokens_per_escalation: int = 1_500_000
+
+    @field_validator("max_turns_per_stage")
+    @classmethod
+    def _validate_max_turns(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"max_turns_per_stage 必須 >= 1,收到:{v}")
+        return v
 
 
 class DiagnosticSample(BaseModel):
@@ -155,6 +168,12 @@ class EscalationReport(BaseModel):
     stage3_code_fix: Optional[StageResult] = None
     final_resolved: bool = False
     code_diff: Optional[str] = None
+    # 這次 escalate() 呼叫(stage0 分析 + stage1~3)累計消耗的 token 數,見
+    # pipeline.py::TokenBudget。None 表示尚未統計過(理論上不會發生,保留
+    # 是為了跟 Rust 側 Option<u64> 的預設語意一致)。
+    tokens_used: Optional[int] = None
+    # 是否因為觸及 escalation.max_tokens_per_escalation 而提早跳過/中止某個階段。
+    budget_exhausted: bool = False
 
 
 class IncidentPush(BaseModel):

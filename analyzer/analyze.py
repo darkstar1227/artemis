@@ -247,6 +247,13 @@ def build_report(incident: dict, project_root: Path, context_lines: int) -> str:
 
         resolved = escalation.get("final_resolved")
         lines.append(f"**最終狀態:{'已解決 ✅' if resolved else '尚未解決,需要開發者介入 ⚠️'}**")
+
+        tokens_used = escalation.get("tokens_used")
+        if tokens_used is not None:
+            budget_note = "(已觸及 max_tokens_per_escalation 預算,部分階段被中止/跳過)" if escalation.get(
+                "budget_exhausted"
+            ) else ""
+            lines.append(f"**Token 用量:{tokens_used:,}** {budget_note}")
         lines.append("")
 
         if escalation.get("code_diff"):

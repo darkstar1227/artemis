@@ -148,6 +148,19 @@ pub struct EscalationConfig {
     pub execution_base_url: Option<String>,
     #[serde(default)]
     pub execution_api_key_env: Option<String>,
+
+    /// stage1~3 每一層 `Runner.run()` 的 max_turns 上限。agent_service 端每一輪都是
+    /// 把完整對話歷史重送一次給模型,turns 數愈高就愈接近二次方成長的 token 成本;
+    /// 30 這個舊的硬上限對大多數事件都偏保守,預設砍到 12,仍留探索(list_dir/
+    /// grep_files)加實際動作的空間。
+    #[serde(default = "default_max_turns_per_stage")]
+    pub max_turns_per_stage: u32,
+
+    /// 單次 escalate() 呼叫(stage0 多模型分析 + stage1~3)累計可用的 token 預算,
+    /// 用 Agents SDK 回報的 usage 加總比對,超過後跳過尚未執行的後續階段。
+    /// 0 表示不限制。
+    #[serde(default = "default_max_tokens_per_escalation")]
+    pub max_tokens_per_escalation: u64,
 }
 
 impl Default for EscalationConfig {
@@ -162,12 +175,22 @@ impl Default for EscalationConfig {
             execution_model: None,
             execution_base_url: None,
             execution_api_key_env: None,
+            max_turns_per_stage: default_max_turns_per_stage(),
+            max_tokens_per_escalation: default_max_tokens_per_escalation(),
         }
     }
 }
 
 fn default_verify_window_ms() -> u64 {
     15000
+}
+
+fn default_max_turns_per_stage() -> u32 {
+    12
+}
+
+fn default_max_tokens_per_escalation() -> u64 {
+    1_500_000
 }
 
 /// `agent_service` 是取代 Claude Code CLI 的 Python 服務(OpenAI Agents SDK),
@@ -505,6 +528,9 @@ impl Config {
     /// 驗證欄位間的邏輯限制(型別層級已經由 serde/toml 檢查過)。
     /// 目前只驗證 [incidents];其餘表格暫無跨欄位限制。
     pub fn validate(&self) -> Result<()> {
+        if self.escalation.max_turns_per_stage < 1 {
+            anyhow::bail!("[escalation] max_turns_per_stage 必須 >= 1");
+        }
         let inc = &self.incidents;
         if inc.max_queue < 1 {
             anyhow::bail!("[incidents] max_queue 必須 >= 1");
@@ -595,6 +621,13 @@ stage3_config_files = [
 # execution_model = "your-execution-model"      # 未設定則沿用 [orchestrator].model
 # execution_base_url = "http://localhost:4000/v1"
 # execution_api_key_env = "LITELLM_API_KEY"
+
+# stage1~3 每一層 Runner.run() 的 max_turns 上限(每輪都會重送完整對話歷史給模型,
+# 調低可壓低 token 成本)。
+max_turns_per_stage = 12
+# 單次事件升級(stage0 多模型分析 + stage1~3)累計可用的 token 預算,超過後跳過
+# 尚未執行的後續階段。0 表示不限制。
+max_tokens_per_escalation = 1500000
 
 # 取代 Claude Code CLI 的 Python 服務(agent_service/,OpenAI Agents SDK):
 # 判斷層與執行層都在這裡執行,偵測到事件時 Rust 會呼叫這個本機 HTTP 服務。

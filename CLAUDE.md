@@ -64,7 +64,7 @@ pytest tests/` do the same thing:
 cd agent_service
 uv sync --all-groups                                          # installs pytest/pylint dev deps too
 uv run python -c "import main"                              # import/syntax check
-uv run pytest tests/ -v                                      # runs all four smoke tests above
+uv run pytest tests/ -v                                      # runs all smoke tests above
 uv run pylint main.py tools.py agents_def.py pipeline.py schemas.py central.py  # lint (10/10 gate)
 uv run uvicorn main:app --port 8787                          # then curl -X POST /escalate — see
                                                                # agent_client.rs for the request shape
@@ -259,9 +259,35 @@ assumed to mean "session already exists" and ignored, matching this codebase's d
 philosophy elsewhere) — sanc itself doesn't expose an "already exists" check yet at the prototype
 stage this was integrated against.
 
-`run_stage()`'s `max_turns` is 30 (`pipeline.py`) to leave room for a `list_dir`/`grep_files`
-exploration pass before the stage's actual read/edit/bash calls, while still being a hard cap so an
-agent can't loop indefinitely.
+`run_stage()`'s `max_turns` is `[escalation].max_turns_per_stage` (`pipeline.py`, default 12,
+previously a hardcoded 30) to leave room for a `list_dir`/`grep_files` exploration pass before the
+stage's actual read/edit/bash calls, while still being a hard cap so an agent can't loop
+indefinitely — it's also the first lever on token cost, since the Agents SDK resends the *entire*
+conversation history on every turn, so cost per stage grows roughly quadratically with turn count.
+
+**Token budget (`[escalation].max_tokens_per_escalation`, `pipeline.py::TokenBudget`)**: a single
+counter shared across every `Runner.run()` call within one `escalate()` invocation — stage0's
+dispatch/judgment/synthesis calls and stage1~3 — accumulated from each call's reported
+`usage.total_tokens`. Default 1,500,000; `0` disables it. Checked at two points: before a stage
+starts (`budget.exhausted()` — the stage is skipped entirely, recorded as a non-`ran` `StageResult`
+and `report.budget_exhausted = True`) and mid-stage via `RunHooks.on_llm_end`
+(`_BudgetAbortHooks`), which raises to abort a stage1~3 run that's already over budget partway
+through a multi-turn loop rather than letting it keep spending until `max_turns_per_stage`. An
+aborted stage is still recorded as a partial result (whatever the agent had produced so far, likely
+without a trailing JSON block). `EscalationReport.tokens_used`/`budget_exhausted` (mirrored
+field-for-field in `schemas.py` and `src/incident.rs`, both `#[serde(default)]`/`Optional` so old
+incident JSON without them still parses) carry the final tally onto the incident, and
+`analyzer/analyze.py` prints the token usage line in the rendered report. `_capture_diff()` runs on
+every exit path from `escalate()` once stage2 may have run (including a mid-flow budget-exhausted
+return), since stage2's `edit_file`/`write_file` calls can leave uncommitted changes on disk even
+when a later stage never runs.
+
+To reduce a later stage's own token spend, `StageContext.files_touched` (populated by
+`read_file`/`edit_file`/`write_file`/`grep_files`) tracks which paths the current stage already
+looked at or changed; `pipeline.py::handoff_context()` renders the previous stage's
+`action_taken`/`reasoning` plus that file list (truncated to `HANDOFF_MAX_CHARS` = 2000 chars) and
+prepends it to stage2/stage3's prompt, so the next stage can skip re-exploring files the previous
+one already located instead of running its own `list_dir`/`grep_files` pass from scratch.
 
 Each stage is skipped if the previous stage's `verify_resolved()` check passed. `verify_resolved()`
 (now in `pipeline.py`, run off the event loop via `asyncio.to_thread`) runs
@@ -316,7 +342,10 @@ bounded capacity), `max_pending_escalations` (default 8, in-flight escalation ca
 `[escalation]`. `[escalation]` no longer has
 `claude_bin`/`model` (those were Claude Code CLI-specific); it instead has optional
 `execution_model`/`execution_base_url`/`execution_api_key_env` for stage1~3's model, falling back to
-`[orchestrator]`'s settings when unset. `[remote]` (`enabled`, `device_id`, `sanc_bin`, `state_dir`,
+`[orchestrator]`'s settings when unset, plus `max_turns_per_stage` (default 12, per-stage
+`Runner.run()` turn cap) and `max_tokens_per_escalation` (default 1,500,000, `0` = unlimited,
+cumulative token budget across one escalation's model calls) — see the token budget paragraph in
+the stage-flow section above. `[remote]` (`enabled`, `device_id`, `sanc_bin`, `state_dir`,
 `timeout_secs`, `allowed_commands`) configures the optional SessAnchor remote-execution backend
 described above — disabled by default, and `remote_exec` isn't even added to a stage's tool list
 unless `enabled` and `device_id` are both set.
@@ -328,8 +357,10 @@ the Python readers (both `agent_service` and `analyzer/`). `Source` is an enum (
 `LogFile(String)`, the latter also used for the synthetic `"system-resources"` source from
 resource.rs). `EscalationReport` holds an optional `multi_agent_analysis: Option<serde_json::Value>`
 (deliberately untyped on the Rust side now — its shape is owned by `agent_service/schemas.py`'s
-`Synthesis`, Rust just stores/forwards it) plus up to three `StageResult`s and
-`final_resolved`/`code_diff`.
+`Synthesis`, Rust just stores/forwards it) plus up to three `StageResult`s,
+`final_resolved`/`code_diff`, and `tokens_used: Option<u64>`/`budget_exhausted: bool` (the token
+budget accounting described in the stage-flow section above; `#[serde(default)]` so pre-budget
+incident JSON still deserializes).
 
 Lifecycle fields added for dedup/recurrence tracking (all `#[serde(default)]` so old JSON without
 them still deserializes, see `incident.rs`'s `old_format_json_deserializes_with_defaults` test):

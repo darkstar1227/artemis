@@ -48,6 +48,16 @@ class StageContext:
     remote_timeout_secs: int = 120
     remote_allowed_commands: list[str] = field(default_factory=list)
 
+    # 這個 stage 讀過/改過/grep 過的檔案路徑(只留路徑,不留內容——內容本來就在
+    # 這次 run 的對話歷史裡,重複存一份只會多花記憶體不會省 token)。用來組出
+    # 交給下一個 stage 的 handoff 摘要(見 pipeline.py::handoff_context),讓後面
+    # 的 stage 不用重新探索前一個 stage 已經找過的檔案。
+    files_touched: list[str] = field(default_factory=list)
+
+    def note_file_touched(self, path: str) -> None:
+        if path not in self.files_touched:
+            self.files_touched.append(path)
+
 
 class PermissionDenied(Exception):
     pass
@@ -109,6 +119,7 @@ def read_file(wrapper: RunContextWrapper[StageContext], path: str) -> str:
     """
     ctx = wrapper.context
     resolved = _resolve_within_cwd(ctx, path)
+    ctx.note_file_touched(path)
     if not resolved.exists():
         return f"[錯誤] 檔案不存在:{path}"
     try:
@@ -201,6 +212,7 @@ def grep_files(wrapper: RunContextWrapper[StageContext], pattern: str, path: str
         pattern: 要搜尋的正規表示式。
         path: 搜尋範圍,可以是單一檔案或目錄(相對於專案目錄),預設為專案根目錄。
     """
+    wrapper.context.note_file_touched(path)
     return _grep_scan(wrapper.context, pattern, path)
 
 
@@ -218,6 +230,7 @@ def edit_file(wrapper: RunContextWrapper[StageContext], path: str, old_text: str
         _check_editable(ctx, path)
     except PermissionDenied as e:
         return f"[權限拒絕] {e}"
+    ctx.note_file_touched(path)
     resolved = _resolve_within_cwd(ctx, path)
     if not resolved.exists():
         return f"[錯誤] 檔案不存在:{path}"
@@ -244,6 +257,7 @@ def write_file(wrapper: RunContextWrapper[StageContext], path: str, content: str
         _check_editable(ctx, path)
     except PermissionDenied as e:
         return f"[權限拒絕] {e}"
+    ctx.note_file_touched(path)
     resolved = _resolve_within_cwd(ctx, path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     resolved.write_text(content, encoding="utf-8")
